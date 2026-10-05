@@ -1,0 +1,20 @@
+[package]
+name = "biome-rules-host"
+version.workspace = true
+edition.workspace = true
+description = "Runs a compiled biome-rules module (Rules ABI v1) in a WebAssembly interpreter. Reference host for conformance tests, the local dev match server and the publish tool's validation; mirrors what cloudflare/biome-match does in TypeScript."
+
+[lib]
+name = "biome_rules_host"
+path = "src/lib.rs"
+
+[dependencies]
+biome-rules = { path = "../biome-rules" }
+# Pure-Rust interpreter: small, no JIT, no system dependencies, fuel metering.
+wasmi = "2"
+serde_json = { workspace = true }
+thiserror = "2"
+
+[dev-dependencies]
+rules-tictactoe = { path = "../rules-tictactoe" }
+rules-highcard = { path = "../rules-highcard" }

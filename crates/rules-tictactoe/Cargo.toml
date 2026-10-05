@@ -1,0 +1,14 @@
+[package]
+name = "rules-tictactoe"
+version.workspace = true
+edition.workspace = true
+description = "Tic-tac-toe as a biome-rules crate: the smallest complete game. Used by the match host's tests and as the template for new games."
+
+[lib]
+# cdylib: the WebAssembly module the match host loads.
+# rlib:   the same rules linked into a native client / tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+biome-rules = { path = "../biome-rules" }
+serde = { workspace = true }

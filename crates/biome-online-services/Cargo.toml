@@ -1,0 +1,109 @@
+[package]
+name = "biome-online-services"
+version.workspace = true
+edition.workspace = true
+description = "Biome Online Services (BOS) — game-facing client for biome platform services. Identity (launch nonce or attach-with-consent), signed game tickets, friends, presence, voice room handoff, match orchestration."
+
+# Standalone — no biome-core, no Dioxus, no UI. Embeddable in any Rust game
+# (Bevy, plain), or in the biome-app desktop client itself (where the server
+# half runs and the IPC layer exposes platform services to launched games).
+
+[lib]
+name = "biome_online_services"
+path = "src/lib.rs"
+
+[[bin]]
+name = "biome-os-host"
+path = "src/bin/host.rs"
+# Standalone reference IPC server. Lets a game test the BOS client against a
+# fake biome desktop process before biome-app embeds the real server. Hidden
+# behind the `host-bin` feature so games linking the library don't compile it.
+required-features = ["host-bin"]
+
+[[example]]
+name = "tictactoe_bot"
+# Plays tic-tac-toe through a match host: the dev server with a dev ticket,
+# or production with a real ticket from the running Biome app.
+required-features = ["match-client"]
+
+[[example]]
+name = "attach_demo"
+# Standalone "does Biome see me?" binary: detect → wake → attach → ticket.
+required-features = ["ticket-verify"]
+
+[features]
+default = []
+# Build the bevy plugin (BosPlugin) — drains BiomeEvents into Bevy's EventWriter.
+bevy = ["dep:bevy_app", "dep:bevy_ecs"]
+# Build the biome-os-host reference binary. Off by default so library consumers
+# don't pull in the binary's deps.
+host-bin = ["dep:clap", "dep:tracing-subscriber"]
+# Offline verifier for game tickets (ES256 JWT against the published JWKS).
+# Match hosts and tools want this; a game that only forwards tickets doesn't.
+ticket-verify = ["dep:jsonwebtoken", "dep:serde_json", "dep:base64"]
+# MatchClient: create / join a hosted match and play it over a WebSocket,
+# with reconnection, from sync game code. See docs/MATCH_HOST_SPEC.md §5.
+match-client = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:serde_json", "dep:base64", "dep:biome-rules"]
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+bincode = { version = "2.0", features = ["serde"] }
+
+# Async runtime — tokio internally, on a dedicated thread inside BiomeClient.
+# Game code never sees .await; everything surfaces via sync-poll API.
+tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = { workspace = true }
+
+# Bridge tokio → game sync code without exposing futures to the game.
+crossbeam-channel = "0.5"
+
+# Errors
+thiserror = "2"
+
+# Logging — game can opt in; library never initializes a subscriber itself.
+tracing = { workspace = true }
+
+# Time / IDs
+uuid = { workspace = true }
+
+# Optional: ticket verification
+jsonwebtoken = { version = "9.3", optional = true }
+serde_json = { workspace = true, optional = true }
+base64 = { version = "0.22", optional = true }
+
+# Optional: match client
+reqwest = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+biome-rules = { path = "../biome-rules", optional = true }
+
+# Optional: bevy plugin
+bevy_app = { version = "0.16", default-features = false, optional = true }
+bevy_ecs = { version = "0.16", default-features = false, optional = true }
+
+# Optional: biome-os-host binary deps
+clap = { version = "4.5", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+# Windows: read the `biome:` URL-scheme registration (HKCU) to tell
+# "installed but not running" from "not installed". Already in the workspace
+# lock via biome-core.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[dev-dependencies]
+jsonwebtoken = "9.3"
+serde_json = { workspace = true }
+base64 = "0.22"
+# The match-client tests run a real (local) match host in-process with the
+# two example games.
+biome-match-dev = { path = "../biome-match-dev" }
+biome-rules-host = { path = "../biome-rules-host" }
+rules-tictactoe = { path = "../rules-tictactoe" }
+rules-highcard = { path = "../rules-highcard" }
+
+[[test]]
+name = "match_client"
+required-features = ["match-client"]

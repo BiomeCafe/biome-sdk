@@ -1,0 +1,24 @@
+# CI for the Biome game SDK: the same tests that guard the SDK in the
+# Biome repository, run standalone.
+name: CI
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo test --workspace --features "biome-online-services/ticket-verify biome-online-services/match-client"
+      - name: Example rules compile to WebAssembly
+        run: cargo build --release --target wasm32-unknown-unknown -p rules-tictactoe -p rules-highcard

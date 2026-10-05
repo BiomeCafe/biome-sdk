@@ -1,0 +1,27 @@
+[package]
+name = "biome-rules"
+version.workspace = true
+edition.workspace = true
+description = "Rules SDK for Biome-hosted turn-based games: one pure crate per game, compiled natively into the client and to WebAssembly for the match host. See docs/MATCH_HOST_SPEC.md."
+
+# Deliberately tiny and pure: no tokio, no Bevy, no I/O, no system time, no
+# OS randomness. Everything here has to behave identically on x86_64 and on
+# wasm32-unknown-unknown, because the same rules run on the player's machine
+# and inside the match Durable Object.
+
+[lib]
+name = "biome_rules"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+# Compact, deterministic binary encoding for State / Move / View / Event.
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+# Host-facing envelopes (meta, seats, reject, outcome) are JSON so the
+# TypeScript host can read them without a postcard decoder.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Cross-check of the in-crate ChaCha8 against a published implementation.
+rand_chacha = "0.3"
+rand_core = "0.6"

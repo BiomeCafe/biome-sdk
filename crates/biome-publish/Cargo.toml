@@ -1,0 +1,36 @@
+[package]
+name = "biome-publish"
+version.workspace = true
+edition.workspace = true
+description = "Publishes a game release to Biome from the game's own CI: validates biome.toml and the rules module, zips client builds deterministically, uploads through the game-publish edge function and submits for review. See docs/GAME_PUBLISHING_SPEC.md section 7."
+
+[lib]
+name = "biome_publish"
+path = "src/lib.rs"
+
+[[bin]]
+name = "biome-publish"
+path = "src/main.rs"
+
+[dependencies]
+# The same gate the match host uses: a module that fails here would never run.
+biome-rules-host = { path = "../biome-rules-host" }
+biome-rules = { path = "../biome-rules" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.9"
+sha2 = { workspace = true }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+# Blocking client: a CLI with one request in flight at a time needs no
+# async runtime of its own. rustls (from the workspace entry), no OpenSSL.
+reqwest = { workspace = true, features = ["blocking"] }
+# Same feature set as velopack's zip, so a workspace build and a
+# `-p biome-publish` build compress identically.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# In-process mock of the game-publish API for the end-to-end tests.
+axum = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"

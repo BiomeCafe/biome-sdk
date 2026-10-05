@@ -1,0 +1,25 @@
+[package]
+name = "biome-match-dev"
+version.workspace = true
+edition.workspace = true
+description = "Local match host for game developers: loads a compiled biome-rules module and speaks the same HTTP + WebSocket protocol as the production host (cloudflare/biome-match), with no Cloudflare, no database and no real tickets. Also the server the SDK's match-client tests run against."
+
+[lib]
+name = "biome_match_dev"
+path = "src/lib.rs"
+
+[[bin]]
+name = "biome-match-dev"
+path = "src/main.rs"
+
+[dependencies]
+biome-rules = { path = "../biome-rules" }
+biome-rules-host = { path = "../biome-rules-host" }
+axum = { workspace = true, features = ["ws"] }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }

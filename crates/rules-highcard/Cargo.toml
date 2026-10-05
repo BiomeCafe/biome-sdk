@@ -1,0 +1,12 @@
+[package]
+name = "rules-highcard"
+version.workspace = true
+edition.workspace = true
+description = "High-card as a biome-rules crate: hidden hands, a shuffled deck, and events scoped per seat. The match host's test game for hidden information and server-side randomness."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+biome-rules = { path = "../biome-rules" }
+serde = { workspace = true }
