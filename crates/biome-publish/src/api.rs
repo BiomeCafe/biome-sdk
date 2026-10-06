@@ -43,7 +43,11 @@ const UPLOAD_ATTEMPTS: u32 = 3;
 
 // ---------------------------------------------------------------- wire types
 
-/// `POST /releases` body.
+/// `POST /releases` body. A game sends `clients` (and maybe `rules`); a
+/// software product sends `downloads`. Empty lists are left out, so a game
+/// with zip clients sends exactly the body it always did. A per-file client
+/// (spec §10) carries `contents`; `objects` describes the gzip forms of
+/// objects the CLI is ready to upload, `uploaded` the ones it just did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateRelease {
     pub app_id: String,
@@ -52,7 +56,43 @@ pub struct CreateRelease {
     pub notes: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<RulesMeta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clients: Vec<ClientMeta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub downloads: Vec<DownloadMeta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<ObjectMeta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uploaded: Vec<String>,
+}
+
+/// One file of a per-file client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentMeta {
+    pub path: String,
+    pub size: u64,
+    pub sha256: String,
+    pub executable: bool,
+}
+
+/// The stored (gzip) form of an object, for its presigned PUT.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectMeta {
+    pub sha256: String,
+    pub stored_size: u64,
+    pub stored_sha256: String,
+}
+
+/// One file of a software release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DownloadMeta {
+    /// `any` or an OS platform.
+    pub platform: String,
+    pub file_name: String,
+    pub size: u64,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,13 +102,28 @@ pub struct RulesMeta {
     pub sha256: String,
 }
 
+/// A client build: one zip (the shape since the start), or file by file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientMeta {
+#[serde(untagged)]
+pub enum ClientMeta {
+    Zip(ZipClientMeta),
+    Files(FilesClientMeta),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZipClientMeta {
     pub platform: String,
     pub file_name: String,
     pub size: u64,
     pub sha256: String,
     pub entrypoint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesClientMeta {
+    pub platform: String,
+    pub entrypoint: String,
+    pub contents: Vec<ContentMeta>,
 }
 
 /// `POST /releases` answer (201 new, 200 resumed).
@@ -79,6 +134,34 @@ pub struct CreateResponse {
     pub status: String,
     #[serde(default)]
     pub uploads: Vec<Upload>,
+    /// Releases with per-file clients: what the game stores already.
+    #[serde(default)]
+    pub objects: Option<ObjectsSummary>,
+}
+
+/// The objects of a release with per-file clients.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct ObjectsSummary {
+    /// Distinct objects in the release.
+    #[serde(default)]
+    pub total: u64,
+    /// Of those, already in Biome's storage.
+    #[serde(default)]
+    pub stored: u64,
+    /// Not in storage yet.
+    #[serde(default)]
+    pub missing: Vec<MissingObject>,
+    /// Missing objects without a PUT in this answer (not described yet, or
+    /// over the server's cap): ask again.
+    #[serde(default)]
+    pub unsigned: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MissingObject {
+    pub sha256: String,
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// One presigned upload. Send `method` to `url` with exactly `headers`.
@@ -87,6 +170,12 @@ pub struct Upload {
     pub kind: String,
     #[serde(default)]
     pub platform: Option<String>,
+    /// The file's published name (always sent now; what tells downloads apart).
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// An object's sha256 (kind `object`).
+    #[serde(default)]
+    pub sha256: Option<String>,
     #[serde(default = "default_method")]
     pub method: String,
     pub url: String,
@@ -102,13 +191,18 @@ fn default_method() -> String {
 }
 
 impl Upload {
-    /// `("rules", "any")` or `("client", <platform>)`.
+    /// `("rules", "any")`, `("client", <platform>)`, `("download",
+    /// <file_name>)` or `("object", <sha256>)`: what the upload is for.
+    /// Several downloads may share a platform, so they are told apart by
+    /// name.
     pub fn target(&self) -> (String, String) {
-        let platform = match self.kind.as_str() {
+        let which = match self.kind.as_str() {
             "rules" => "any".to_string(),
+            "download" => self.file_name.clone().unwrap_or_default(),
+            "object" => self.sha256.clone().unwrap_or_default(),
             _ => self.platform.clone().unwrap_or_default(),
         };
-        (self.kind.clone(), platform)
+        (self.kind.clone(), which)
     }
 
     /// The headers as an HTTP header map. Numbers and booleans are sent as
@@ -134,6 +228,17 @@ impl Upload {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SubmitResponse {
     pub status: String,
+    /// A file listing that waits for review: why (e.g. "pack.zip: contains
+    /// setup.exe"). Empty otherwise.
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// The virus scan: "pending" right after submit.
+    #[serde(default)]
+    pub scan: Option<String>,
+    /// What happens when the scan is clean: "live" (a file listing whose
+    /// look inside was clean) or "review".
+    #[serde(default)]
+    pub after_scan: Option<String>,
 }
 
 /// One entry of `GET /releases?app_id=`.
@@ -155,6 +260,13 @@ pub struct ReleaseSummary {
     pub submitted_at: Option<String>,
     #[serde(default)]
     pub reviewed_at: Option<String>,
+    /// The virus scan of its files: pending, clean, infected, incomplete,
+    /// error, overridden or skipped.
+    #[serde(default)]
+    pub scan: Option<String>,
+    /// The scan in a line: "scanning for viruses", "virus found: a.zip: …".
+    #[serde(default)]
+    pub scan_note: Option<String>,
 }
 
 // ------------------------------------------------------------ configuration
@@ -194,7 +306,7 @@ pub fn check_token(raw: Option<&str>) -> Result<String, Error> {
     let token = raw.map(str::trim).unwrap_or("");
     if token.is_empty() {
         return Err(Error::invalid(format!(
-            "{TOKEN_ENV} is not set: create a publish token for this game (guild admin, game settings) and store it as a CI secret"
+            "{TOKEN_ENV} is not set: create a publish token for this game or product (guild page, GAMES or SOFTWARE, MANAGE) and store it as a CI secret"
         )));
     }
     if !token.bytes().all(|b| b.is_ascii_graphic()) {
@@ -347,7 +459,20 @@ pub fn refusal(status: u16, body: &str) -> Refusal {
         for m in missing {
             let kind = m.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
             let platform = m.get("platform").and_then(|v| v.as_str()).unwrap_or("any");
-            details.push(format!("missing upload: {kind} {platform}"));
+            let text = |k: &str| m.get(k).and_then(|v| v.as_str());
+            match (kind, text("file_name"), text("path"), text("sha256")) {
+                ("object", _, Some(path), Some(sha)) => {
+                    details.push(format!("missing upload: object {path} ({})", sha.get(..12).unwrap_or(sha)))
+                }
+                (_, Some(name), _, _) => details.push(format!("missing upload: {kind} {platform} {name}")),
+                _ => details.push(format!("missing upload: {kind} {platform}")),
+            }
+        }
+    }
+    // A file listing's files that are not plain files (not-plain-file).
+    if let Some(files) = obj.get("files").and_then(|v| v.as_array()) {
+        for f in files.iter().filter_map(|v| v.as_str()) {
+            details.push(format!("not a plain file: {f}"));
         }
     }
     Refusal { status, error: text("error").unwrap_or_else(|| format!("http-{status}")), message: text("message"), details }
@@ -508,5 +633,53 @@ mod tests {
         assert_eq!(r.target(), ("rules".to_string(), "any".to_string()));
         assert_eq!(r.method, "PUT");
         assert_eq!(redact(&Url::parse(&u.url).unwrap()), "https://r2.example/k");
+        // Downloads are told apart by name; a client ignores the name.
+        let d: Upload = serde_json::from_str(
+            r#"{"kind":"download","platform":"any","file_name":"addon.zip","url":"https://r2.example/d"}"#,
+        )
+        .unwrap();
+        assert_eq!(d.target(), ("download".to_string(), "addon.zip".to_string()));
+        let c: Upload = serde_json::from_str(
+            r#"{"kind":"client","platform":"linux-x64","file_name":"g.zip","url":"https://r2.example/c"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.target(), ("client".to_string(), "linux-x64".to_string()));
+    }
+
+    /// A per-file create answer as game-publish builds it (objectUploads).
+    #[test]
+    fn parses_the_per_file_create_response() {
+        let body = r#"{"release_id":"00000000-0000-4000-8000-000000000002","status":"uploading","resumed":true,
+            "uploads":[{"kind":"object","platform":"any","sha256":"aaaa","method":"PUT",
+               "url":"https://acct.r2.cloudflarestorage.com/biome-game-builds/g/objects/aaaa?X-Amz-Signature=ef",
+               "headers":{"content-length":"300","x-amz-checksum-sha256":"qqo="},"expires_at":1791158400}],
+            "objects":{"total":3,"stored":1,"missing":[{"sha256":"aaaa","size":1000},{"sha256":"bbbb","size":5}],"unsigned":1}}"#;
+        let r: CreateResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(r.uploads[0].target(), ("object".to_string(), "aaaa".to_string()));
+        let o = r.objects.unwrap();
+        assert_eq!((o.total, o.stored, o.unsigned, o.missing.len()), (3, 1, 1, 2));
+        // A zip-only answer has no objects.
+        let zip: CreateResponse = serde_json::from_str(r#"{"release_id":"x","uploads":[]}"#).unwrap();
+        assert!(zip.objects.is_none());
+    }
+
+    #[test]
+    fn missing_objects_are_named_by_a_path() {
+        let r = refusal(
+            409,
+            r#"{"error":"upload-incomplete","missing":[{"kind":"object","platform":"any","sha256":"0123456789abcdef0123","path":"data/a.pak"}]}"#,
+        );
+        assert_eq!(r.details, ["missing upload: object data/a.pak (0123456789ab)"]);
+    }
+
+    #[test]
+    fn missing_downloads_are_named() {
+        let r = refusal(
+            409,
+            r#"{"error":"upload-incomplete","missing":[{"kind":"download","platform":"any","file_name":"addon.zip"}]}"#,
+        );
+        assert_eq!(r.details, ["missing upload: download any addon.zip"]);
+        let r = refusal(400, r#"{"error":"not-plain-file","message":"publish it as software","files":["slicer.exe"]}"#);
+        assert_eq!((r.error.as_str(), r.details.as_slice()), ("not-plain-file", ["not a plain file: slicer.exe".to_string()].as_slice()));
     }
 }

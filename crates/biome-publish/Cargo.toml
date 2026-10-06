@@ -2,7 +2,7 @@
 name = "biome-publish"
 version.workspace = true
 edition.workspace = true
-description = "Publishes a game release to Biome from the game's own CI: validates biome.toml and the rules module, zips client builds deterministically, uploads through the game-publish edge function and submits for review. See docs/GAME_PUBLISHING_SPEC.md section 7."
+description = "Publishes a game or software release (add-ons, plugins, tools) to Biome from the product's own CI: validates biome.toml and the rules module, zips folders deterministically, uploads through the game-publish edge function and submits for review. See docs/GAME_PUBLISHING_SPEC.md section 7 and docs/SOFTWARE_PRODUCTS_SPEC.md."
 
 [lib]
 name = "biome_publish"

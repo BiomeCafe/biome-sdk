@@ -4,11 +4,13 @@
 //! dev:<user id>:<username>` is believed as written. The production host
 //! verifies a signed game ticket instead.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,7 +18,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 
-use crate::{Host, Out, Reply, User, TICK};
+use crate::{parse_dev_ticket, Host, Out, Reply, User, TICK};
 
 fn reply((status, body): Reply) -> Response {
     (StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(body)).into_response()
@@ -27,12 +29,7 @@ fn reply((status, body): Reply) -> Response {
 pub fn dev_user(headers: &HeaderMap) -> Option<User> {
     let raw = headers.get("authorization")?.to_str().ok()?;
     let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?.trim();
-    let rest = token.strip_prefix("dev:")?;
-    let (user_id, username) = rest.split_once(':')?;
-    if user_id.is_empty() || username.is_empty() || username.len() > 80 {
-        return None;
-    }
-    Some(User { user_id: user_id.to_string(), username: username.to_string() })
+    parse_dev_ticket(token)
 }
 
 fn unauthorized() -> Response {
@@ -86,6 +83,81 @@ async fn rejoin(State(host): State<Arc<Host>>, Path((app, id)): Path<(String, St
     reply((status, out))
 }
 
+/// `POST /v1/:app/matches/:id/join` — the open seat of a listed match.
+async fn join_open(State(host): State<Arc<Host>>, Path((app, id)): Path<(String, String)>, headers: HeaderMap) -> Response {
+    let Some(user) = dev_user(&headers) else { return unauthorized() };
+    if !host.has_app(&app) {
+        return reply((404, json!({ "error": "unknown-app" })));
+    }
+    let (status, mut out) = host.join_open(&app, &id, &user);
+    if status == 200 {
+        out["ws_url"] = json!(ws_url(&headers, &app, &id));
+    }
+    reply((status, out))
+}
+
+/// `GET /v1/:app/open?rules_version=` — public.
+async fn open_list(State(host): State<Arc<Host>>, Path(app): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let version = q.get("rules_version").map(String::as_str).unwrap_or("");
+    reply(host.open_matches(&app, version))
+}
+
+/// `GET /v1/:app/queue?mode=&rules_version=` — the queue socket. The first
+/// frame is `hello` with a (dev) ticket, the config and the clock.
+async fn queue_socket(
+    State(host): State<Arc<Host>>,
+    Path(app): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    let mode = q.get("mode").cloned().unwrap_or_default();
+    let version = q.get("rules_version").cloned().unwrap_or_default();
+    if let Err(r) = host.queue_check(&app, &mode, &version) {
+        return reply(r);
+    }
+    let Ok(upgrade) = upgrade else { return reply((426, json!({ "error": "upgrade-required" }))) };
+    upgrade.on_upgrade(move |ws| run_queue_socket(host, app, mode, version, ws))
+}
+
+async fn run_queue_socket(host: Arc<Host>, app: String, mode: String, version: String, ws: WebSocket) {
+    let (mut sink, mut stream) = ws.split();
+    let (conn_id, rx) = match host.queue_connect(&app, &mode, &version) {
+        Ok(v) => v,
+        Err((_, body)) => {
+            let _ = sink.send(Message::Text(json!({ "t": "error", "code": body["error"] }).to_string().into())).await;
+            let _ = sink.send(Message::Close(Some(CloseFrame { code: 4410, reason: "no such queue".into() }))).await;
+            return;
+        }
+    };
+    let writer = tokio::spawn(write_out(sink, rx));
+    while let Some(Ok(msg)) = stream.next().await {
+        match msg {
+            Message::Text(text) => host.queue_frame(conn_id, text.as_str()),
+            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Binary(_) | Message::Close(_) => break,
+        }
+    }
+    host.queue_close(conn_id);
+    writer.abort();
+}
+
+/// Deliver what the host queues for one socket until it says close.
+async fn write_out(mut sink: futures_util::stream::SplitSink<WebSocket, Message>, mut rx: tokio::sync::mpsc::UnboundedReceiver<Out>) {
+    while let Some(out) = rx.recv().await {
+        match out {
+            Out::Frame(text) => {
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            Out::Close(code, reason) => {
+                let _ = sink.send(Message::Close(Some(CloseFrame { code, reason: reason.into() }))).await;
+                break;
+            }
+        }
+    }
+}
+
 async fn summary(State(host): State<Arc<Host>>, Path((app, id)): Path<(String, String)>, headers: HeaderMap) -> Response {
     let Some(user) = dev_user(&headers) else { return unauthorized() };
     reply(host.summary(&app, &id, &user))
@@ -97,28 +169,14 @@ async fn socket(State(host): State<Arc<Host>>, Path((app, id)): Path<(String, St
 
 async fn run_socket(host: Arc<Host>, app: String, match_id: String, ws: WebSocket) {
     let (mut sink, mut stream) = ws.split();
-    let Some((conn_id, mut rx)) = host.connect(&app, &match_id) else {
+    let Some((conn_id, rx)) = host.connect(&app, &match_id) else {
         let _ = sink.send(Message::Text(json!({ "t": "error", "code": "no-such-match" }).to_string().into())).await;
         let _ = sink.send(Message::Close(Some(CloseFrame { code: 4410, reason: "no such match".into() }))).await;
         return;
     };
 
     // Outbound: whatever the host queues for this socket.
-    let writer = tokio::spawn(async move {
-        while let Some(out) = rx.recv().await {
-            match out {
-                Out::Frame(text) => {
-                    if sink.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Out::Close(code, reason) => {
-                    let _ = sink.send(Message::Close(Some(CloseFrame { code, reason: reason.into() }))).await;
-                    break;
-                }
-            }
-        }
-    });
+    let writer = tokio::spawn(write_out(sink, rx));
 
     // Inbound: text frames go to the host; anything else ends the socket.
     while let Some(Ok(msg)) = stream.next().await {
@@ -141,7 +199,10 @@ pub fn router(host: Arc<Host>) -> Router {
         .route("/v1/{app}/matches/join", post(join))
         .route("/v1/{app}/matches/{id}", get(summary))
         .route("/v1/{app}/matches/{id}/rejoin", post(rejoin))
+        .route("/v1/{app}/matches/{id}/join", post(join_open))
         .route("/v1/{app}/matches/{id}/ws", get(socket))
+        .route("/v1/{app}/open", get(open_list))
+        .route("/v1/{app}/queue", get(queue_socket))
         .with_state(host)
 }
 

@@ -50,7 +50,7 @@
 //!   abandoned match end the client instead of looping.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -89,16 +89,49 @@ impl MatchEndpoint {
         format!("{}/v1/{}{}", self.base_url, self.app_id, path)
     }
 
-    fn ws(&self, match_id: &str) -> String {
-        let base = if let Some(rest) = self.base_url.strip_prefix("https://") {
+    fn ws_base(&self) -> String {
+        if let Some(rest) = self.base_url.strip_prefix("https://") {
             format!("wss://{rest}")
         } else if let Some(rest) = self.base_url.strip_prefix("http://") {
             format!("ws://{rest}")
         } else {
             self.base_url.clone()
-        };
-        format!("{base}/v1/{}/matches/{match_id}/ws", self.app_id)
+        }
     }
+
+    fn ws(&self, match_id: &str) -> String {
+        format!("{}/v1/{}/matches/{match_id}/ws", self.ws_base(), self.app_id)
+    }
+
+    /// The queue socket for `mode` at this endpoint's rules version.
+    fn queue_ws(&self, mode: &str) -> String {
+        format!(
+            "{}/v1/{}/queue?mode={}&rules_version={}",
+            self.ws_base(),
+            self.app_id,
+            encode_query(mode),
+            encode_query(&self.rules_version)
+        )
+    }
+
+    /// The public listing of open matches at this endpoint's rules version.
+    fn open_url(&self) -> String {
+        format!("{}/v1/{}/open?rules_version={}", self.base_url, self.app_id, encode_query(&self.rules_version))
+    }
+}
+
+/// Percent-encode a query value (everything but RFC 3986 unreserved
+/// characters), so a version like `1.0.0+build` survives the trip.
+fn encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Optional chess-style clock, enforced by the host.
@@ -122,13 +155,42 @@ pub enum Entry {
     /// You still have the seat token (saved from [`SeatedInfo`]). No ticket
     /// is used.
     Resume { match_id: String, seat_token: String },
+    /// Make a match that is listed for anyone to join (it also gets a code).
+    Open { config: Vec<u8>, clock: Option<ClockConfig> },
+    /// Take the open seat of a listed match.
+    JoinOpen { match_id: String },
+    /// Wait in the queue for `mode` until paired. "ranked" changes ratings; anything else is casual.
+    Queue { mode: String, config: Vec<u8>, clock: Option<ClockConfig> },
+}
+
+/// A player's rating in one mode of one game (Glicko-2). Everyone starts at
+/// 1500 with a deviation of 350; the deviation shrinks as matches are played.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rating {
+    pub rating: f64,
+    pub deviation: f64,
+    pub matches: u32,
+}
+
+/// A listed match waiting for a player (see [`list_open`], [`Entry::JoinOpen`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenMatch {
+    pub match_id: String,
+    /// The username of the player who opened it.
+    pub host: String,
+    /// When it was opened, milliseconds since the Unix epoch.
+    pub created_at_ms: u64,
+    pub rules_version: String,
+    /// The game's own (postcard) config bytes the match was opened with.
+    pub config: Vec<u8>,
 }
 
 /// The seat this client holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeatedInfo {
     pub match_id: String,
-    /// Share this with the other player(s). Present for create / join.
+    /// Share this with the other player(s). Present for create / join and
+    /// open matches; `None` after queue pairing.
     pub join_code: Option<String>,
     pub seat: u8,
     /// Secret for this seat. Save it to [`Entry::Resume`] after a restart.
@@ -216,10 +278,14 @@ pub enum MatchEvent {
     /// An error frame from the host (`rules-version-mismatch`, `replaced`,
     /// `bad-seat-token`, `abandoned`, `not-enough-seats`, …).
     Error { code: String, detail: String },
-    /// Could not get a seat at all (HTTP-level): `unauthorized`,
-    /// `unknown-code`, `match-started`, `match-full`, `bad-config`,
-    /// `network`, …
+    /// Could not get a seat at all: `unauthorized`, `unknown-code`,
+    /// `match-started`, `match-full`, `no-such-match`, `bad-config`,
+    /// `network`, …; from the queue also `queue-timeout`, `rate-limited`,
+    /// `replaced` (the same player queued again elsewhere), `match-failed`.
     Failed { code: String, message: String },
+    /// In the queue. Sent on entry and when the number of players waiting changes.
+    Queued { mode: String, waiting: u32, rating: Option<Rating> },
+    // Pairing ends in the existing `Seated(SeatedInfo)` (join_code: None), then Welcome as usual.
 }
 
 enum Cmd {
@@ -244,8 +310,13 @@ impl MatchClient {
     /// Get a seat and connect. Returns at once; watch the events.
     ///
     /// `ticket` is a game ticket for `endpoint.app_id` (or `dev:<id>:<name>`
-    /// against `biome-match-dev`). It is used once, for the HTTP call; the
-    /// socket and reconnects use the seat token. [`Entry::Resume`] ignores it.
+    /// against `biome-match-dev`). It is used once, for the HTTP call (or
+    /// the queue's `hello`); the socket and reconnects use the seat token.
+    /// [`Entry::Resume`] ignores it.
+    ///
+    /// With [`Entry::Queue`] the client reports [`MatchEvent::Queued`] until
+    /// it is paired, then [`MatchEvent::Seated`] and carries on as after a
+    /// Resume. Dropping the client while queued leaves the queue.
     pub fn start(endpoint: MatchEndpoint, ticket: impl Into<String>, entry: Entry) -> Self {
         let (events_tx, events_rx) = unbounded::<MatchEvent>();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -334,13 +405,37 @@ async fn run(
     events: Sender<MatchEvent>,
     mut cmds: mpsc::UnboundedReceiver<Cmd>,
 ) {
+    // Moves the game makes before the first welcome (while queued, say) wait
+    // here and are sent once the match socket is up.
+    let mut pending: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
+
     // 1. Get a seat.
     let seat = match entry {
         Entry::Resume { match_id, seat_token } => {
             let ws_url = endpoint.ws(&match_id);
             Seat { seat_token, ws_url }
         }
-        other => match take_seat(&endpoint, &ticket, other).await {
+        Entry::Queue { mode, config, clock } => {
+            match queue(&endpoint, &ticket, &mode, &config, clock, &events, &mut cmds, &mut pending).await {
+                QueueEnd::Paired(info) => {
+                    // From here on it is exactly a Resume with the token the
+                    // queue handed over.
+                    let seat = Seat { seat_token: info.seat_token.clone(), ws_url: endpoint.ws(&info.match_id) };
+                    let _ = events.send(MatchEvent::Seated(info));
+                    seat
+                }
+                QueueEnd::Failed { code, message } => {
+                    let _ = events.send(MatchEvent::Failed { code, message });
+                    let _ = events.send(MatchEvent::Disconnected { reconnecting: false });
+                    return;
+                }
+                QueueEnd::Closed => {
+                    let _ = events.send(MatchEvent::Disconnected { reconnecting: false });
+                    return;
+                }
+            }
+        }
+        other => match take_seat(&endpoint, &ticket, &other).await {
             Ok((info, ws_url)) => {
                 let seat = Seat { seat_token: info.seat_token.clone(), ws_url };
                 let _ = events.send(MatchEvent::Seated(info));
@@ -355,7 +450,6 @@ async fn run(
     };
 
     // 2. Connect, and keep reconnecting until told to stop.
-    let mut pending: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
     // What the host had already counted for this seat when this client first
     // connected. `client_seq` on the wire = ours + this.
     let mut seq_base: Option<u64> = None;
@@ -396,19 +490,32 @@ async fn run(
     }
 }
 
-async fn take_seat(endpoint: &MatchEndpoint, ticket: &str, entry: Entry) -> Result<(SeatedInfo, String), (String, String)> {
-    let (url, body) = match &entry {
-        Entry::Create { config, clock } => (
+fn clock_json(clock: Option<ClockConfig>) -> Value {
+    clock.map(|c| json!({ "initial_ms": c.initial_ms, "increment_ms": c.increment_ms })).unwrap_or(Value::Null)
+}
+
+/// The HTTP request that buys a seat for `entry`; `None` for the entries
+/// that don't make one (Resume has its token, Queue uses a socket).
+fn seat_request(endpoint: &MatchEndpoint, entry: &Entry) -> Option<(String, Value)> {
+    match entry {
+        Entry::Create { config, clock } => Some((
             endpoint.http("/matches"),
-            json!({
-                "config": B64.encode(config),
-                "rules_version": endpoint.rules_version,
-                "clock": clock.map(|c| json!({ "initial_ms": c.initial_ms, "increment_ms": c.increment_ms })),
-            }),
-        ),
-        Entry::Join { code } => (endpoint.http("/matches/join"), json!({ "join_code": code })),
-        Entry::Rejoin { match_id } => (endpoint.http(&format!("/matches/{match_id}/rejoin")), json!({})),
-        Entry::Resume { .. } => unreachable!("Resume is handled by the caller"),
+            json!({ "config": B64.encode(config), "rules_version": endpoint.rules_version, "clock": clock_json(*clock) }),
+        )),
+        Entry::Open { config, clock } => Some((
+            endpoint.http("/matches"),
+            json!({ "config": B64.encode(config), "rules_version": endpoint.rules_version, "clock": clock_json(*clock), "listed": true }),
+        )),
+        Entry::Join { code } => Some((endpoint.http("/matches/join"), json!({ "join_code": code }))),
+        Entry::JoinOpen { match_id } => Some((endpoint.http(&format!("/matches/{}/join", encode_query(match_id))), json!({}))),
+        Entry::Rejoin { match_id } => Some((endpoint.http(&format!("/matches/{}/rejoin", encode_query(match_id))), json!({}))),
+        Entry::Resume { .. } | Entry::Queue { .. } => None,
+    }
+}
+
+async fn take_seat(endpoint: &MatchEndpoint, ticket: &str, entry: &Entry) -> Result<(SeatedInfo, String), (String, String)> {
+    let Some((url, body)) = seat_request(endpoint, entry) else {
+        return Err(("internal".into(), "this entry does not take a seat over HTTP".into()));
     };
 
     let client = reqwest::Client::builder()
@@ -452,6 +559,196 @@ async fn take_seat(endpoint: &MatchEndpoint, ticket: &str, entry: Entry) -> Resu
         },
         ws_url,
     ))
+}
+
+enum QueueEnd {
+    Paired(SeatedInfo),
+    Failed { code: String, message: String },
+    /// The game dropped the client while it was queued.
+    Closed,
+}
+
+/// How often a queued client says `ping`, so idle proxies keep the socket.
+/// The host answers without waking the queue object.
+const QUEUE_PING: Duration = Duration::from_secs(30);
+
+fn queue_failed(code: &str, message: impl Into<String>) -> QueueEnd {
+    QueueEnd::Failed { code: code.to_string(), message: message.into() }
+}
+
+/// Wait in the queue until paired. Moves the game sends meanwhile are kept
+/// in `pending` for the match socket.
+#[allow(clippy::too_many_arguments)]
+async fn queue(
+    endpoint: &MatchEndpoint,
+    ticket: &str,
+    mode: &str,
+    config: &[u8],
+    clock: Option<ClockConfig>,
+    events: &Sender<MatchEvent>,
+    cmds: &mut mpsc::UnboundedReceiver<Cmd>,
+    pending: &mut VecDeque<(u64, Vec<u8>)>,
+) -> QueueEnd {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    let url = endpoint.queue_ws(mode);
+    let ws = match tokio::time::timeout(Duration::from_secs(15), tokio_tungstenite::connect_async(url.as_str())).await {
+        Ok(Ok((ws, _))) => ws,
+        // The host refused the upgrade (unknown app or rules version, bad
+        // mode): it says why in a JSON body.
+        Ok(Err(WsError::Http(res))) => {
+            let status = res.status();
+            let v: Value = res.body().as_deref().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or(Value::Null);
+            let code = v.get("error").and_then(Value::as_str).unwrap_or("http-error").to_string();
+            let message = v.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("http {status}"));
+            return QueueEnd::Failed { code, message };
+        }
+        Ok(Err(e)) => return queue_failed("network", e.to_string()),
+        Err(_) => return queue_failed("network", "timed out connecting to the queue"),
+    };
+    let (mut sink, mut stream) = ws.split();
+    let hello = json!({ "t": "hello", "ticket": ticket, "config": B64.encode(config), "clock": clock_json(clock) });
+    if sink.send(Message::Text(hello.to_string())).await.is_err() {
+        return queue_failed("network", "the queue connection closed");
+    }
+
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + QUEUE_PING, QUEUE_PING);
+    loop {
+        tokio::select! {
+            frame = stream.next() => {
+                let text = match frame {
+                    Some(Ok(Message::Text(t))) => t,
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sink.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => continue,
+                    // The ticket is spent: a dropped queue socket cannot be
+                    // resumed. The game asks for a new ticket and queues again.
+                    _ => return queue_failed("network", "the queue connection closed"),
+                };
+                let Ok(v) = serde_json::from_str::<Value>(text.as_str()) else { continue };
+                match v.get("t").and_then(Value::as_str).unwrap_or("") {
+                    "queued" => {
+                        let waiting = v.get("waiting").and_then(Value::as_u64).map(|n| n.min(u64::from(u32::MAX)) as u32).unwrap_or(0);
+                        let _ = events.send(MatchEvent::Queued { mode: mode.to_string(), waiting, rating: parse_rating(v.get("rating")) });
+                    }
+                    "paired" => {
+                        let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+                        let (Some(match_id), Some(seat_token)) = (field("match_id"), field("seat_token")) else {
+                            return queue_failed("bad-response", text.to_string());
+                        };
+                        let rules_version = field("rules_version").unwrap_or_else(|| endpoint.rules_version.clone());
+                        let _ = sink.send(Message::Close(None)).await;
+                        if rules_version != endpoint.rules_version {
+                            return queue_failed("rules-version-mismatch", format!("match runs {rules_version}, this client runs {}", endpoint.rules_version));
+                        }
+                        let seat = v.get("seat").and_then(Value::as_u64).unwrap_or(0).min(u64::from(u8::MAX)) as u8;
+                        return QueueEnd::Paired(SeatedInfo { match_id, join_code: None, seat, seat_token, rules_version });
+                    }
+                    "error" => {
+                        let code = str_of(&v, "code");
+                        let message = v.get("message").or_else(|| v.get("detail")).and_then(Value::as_str).map(str::to_string).unwrap_or_default();
+                        return QueueEnd::Failed { code, message };
+                    }
+                    _ => {}
+                }
+            }
+            cmd = cmds.recv() => match cmd {
+                Some(Cmd::Move { client_seq, mv }) => pending.push_back((client_seq, mv)),
+                Some(Cmd::Start) | Some(Cmd::Sync) => {}
+                Some(Cmd::Close) | None => {
+                    // Closing the socket is what takes us out of the queue.
+                    let _ = sink.send(Message::Close(None)).await;
+                    return QueueEnd::Closed;
+                }
+            },
+            _ = ping.tick() => {
+                if sink.send(Message::Text(json!({ "t": "ping" }).to_string())).await.is_err() {
+                    return queue_failed("network", "the queue connection closed");
+                }
+            }
+        }
+    }
+}
+
+fn parse_rating(v: Option<&Value>) -> Option<Rating> {
+    let o = v?.as_object()?;
+    Some(Rating {
+        rating: o.get("rating")?.as_f64()?,
+        deviation: o.get("deviation")?.as_f64()?,
+        matches: o.get("matches").and_then(Value::as_u64).unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Open matches
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The open matches of the endpoint's game and rules version, fetched in the background.
+///
+/// No ticket is needed: the listing is public. At most 50, newest first.
+/// Take one with [`Entry::JoinOpen`].
+pub fn list_open(endpoint: &MatchEndpoint) -> OpenListing {
+    let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<OpenMatch>, String>>(1);
+    let url = endpoint.open_url();
+    // If the thread cannot be spawned the closure (and the sender) is
+    // dropped, and `poll` reports the closed channel as an error.
+    let _ = std::thread::Builder::new().name("biome-match-open".into()).spawn(move || {
+        let result = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt.block_on(fetch_open(&url)),
+            Err(e) => Err(format!("internal: tokio runtime: {e}")),
+        };
+        let _ = tx.send(result);
+    });
+    OpenListing { rx, taken: AtomicBool::new(false) }
+}
+
+/// A listing in progress (see [`list_open`]).
+pub struct OpenListing {
+    rx: Receiver<Result<Vec<OpenMatch>, String>>,
+    taken: AtomicBool,
+}
+
+impl OpenListing {
+    /// Non-blocking. `Some` exactly once, when the fetch finished either
+    /// way; `None` while it is running and after the result was taken.
+    pub fn poll(&self) -> Option<Result<Vec<OpenMatch>, String>> {
+        if self.taken.load(Ordering::Acquire) {
+            return None;
+        }
+        let result = match self.rx.try_recv() {
+            Ok(r) => r,
+            Err(crossbeam_channel::TryRecvError::Empty) => return None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Err("internal: the listing thread ended".to_string()),
+        };
+        self.taken.store(true, Ordering::Release);
+        Some(result)
+    }
+}
+
+async fn fetch_open(url: &str) -> Result<Vec<OpenMatch>, String> {
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().map_err(|e| format!("internal: {e}"))?;
+    let res = client.get(url).send().await.map_err(|e| format!("network: {e}"))?;
+    let status = res.status();
+    let text = res.text().await.map_err(|e| format!("network: {e}"))?;
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if !status.is_success() {
+        let code = v.get("error").and_then(Value::as_str).unwrap_or("http-error");
+        return Err(format!("{code}: http {status}"));
+    }
+    let Some(items) = v.as_array() else { return Err(format!("bad-response: {text}")) };
+    Ok(items.iter().filter_map(parse_open_match).collect())
+}
+
+fn parse_open_match(v: &Value) -> Option<OpenMatch> {
+    Some(OpenMatch {
+        match_id: v.get("match_id")?.as_str()?.to_string(),
+        host: v.get("host").and_then(Value::as_str).unwrap_or_default().to_string(),
+        created_at_ms: v.get("created_at_ms").and_then(Value::as_u64).unwrap_or(0),
+        rules_version: v.get("rules_version").and_then(Value::as_str).unwrap_or_default().to_string(),
+        config: v.get("config").and_then(Value::as_str).and_then(|s| B64.decode(s).ok()).unwrap_or_default(),
+    })
 }
 
 enum SessionEnd {
@@ -679,6 +976,25 @@ mod tests {
         assert_eq!(e.ws("abc"), "wss://host.example/v1/tictactoe/matches/abc/ws");
         let d = MatchEndpoint::new("http://127.0.0.1:8787", "tictactoe", "1.0.0");
         assert_eq!(d.ws("abc"), "ws://127.0.0.1:8787/v1/tictactoe/matches/abc/ws");
+        assert_eq!(e.queue_ws("ranked"), "wss://host.example/v1/tictactoe/queue?mode=ranked&rules_version=1.0.0");
+        assert_eq!(e.open_url(), "https://host.example/v1/tictactoe/open?rules_version=1.0.0");
+        // A `+` in a version must not turn into a space.
+        let b = MatchEndpoint::new("http://h", "g", "1.0.0+build.7");
+        assert_eq!(b.open_url(), "http://h/v1/g/open?rules_version=1.0.0%2Bbuild.7");
+        assert_eq!(encode_query("a b/c?d&e=f"), "a%20b%2Fc%3Fd%26e%3Df");
+    }
+
+    #[test]
+    fn parses_queue_and_listing_frames() {
+        assert_eq!(
+            parse_rating(Some(&json!({ "rating": 1612.5, "deviation": 80.25, "matches": 12 }))),
+            Some(Rating { rating: 1612.5, deviation: 80.25, matches: 12 })
+        );
+        assert_eq!(parse_rating(Some(&Value::Null)), None);
+        assert_eq!(parse_rating(Some(&json!({ "rating": "high" }))), None);
+        let m = parse_open_match(&json!({ "match_id": "m1", "host": "mandy", "created_at_ms": 5, "rules_version": "1.0.0", "config": B64.encode([3u8, 5]) }));
+        assert_eq!(m, Some(OpenMatch { match_id: "m1".into(), host: "mandy".into(), created_at_ms: 5, rules_version: "1.0.0".into(), config: vec![3, 5] }));
+        assert_eq!(parse_open_match(&json!({ "host": "no id" })), None);
     }
 
     #[test]

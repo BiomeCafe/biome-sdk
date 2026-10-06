@@ -1,4 +1,6 @@
-//! `biome.toml`: what to publish (spec §7).
+//! `biome.toml`: what to publish (spec §7; software: SOFTWARE_PRODUCTS_SPEC.md).
+//!
+//! A game:
 //!
 //! ```toml
 //! [game]
@@ -13,8 +15,25 @@
 //! wasm = "target/wasm32-unknown-unknown/release/mecha_rules.wasm"
 //!
 //! [client.windows-x64]       # one table per platform
-//! path = "dist/windows"      # a folder (zipped by the CLI) or a .zip
+//! path = "dist/windows"      # a folder (sent file by file) or a .zip (sent whole)
 //! entrypoint = "MechaAether.exe"
+//! # delivery = "zip"         # optional: send the folder zipped, as before per-file delivery
+//! ```
+//!
+//! A software product (an add-on, a plugin, a tool):
+//!
+//! ```toml
+//! [product]
+//! app_id = "node-wrangler"
+//!
+//! [release]
+//! version = "1.2.0"
+//!
+//! [[download]]               # 1 to 10 of them
+//! path = "dist/node_wrangler-1.2.0.zip"   # any file, uploaded as is; a folder is zipped
+//! platform = "any"           # default any; or windows-x64, macos-arm64, macos-x64, linux-x64
+//! label = "Add-on"           # optional, shown next to the file
+//! # file_name = "..."        # optional: publish under another name
 //! ```
 //!
 //! Paths are relative to the folder the manifest is in. Parsing checks
@@ -33,6 +52,28 @@ pub const PLATFORMS: [&str; 4] = ["windows-x64", "macos-arm64", "macos-x64", "li
 
 /// Release notes limit (characters), as the `game_releases.notes` column.
 pub const MAX_NOTES_CHARS: usize = 4000;
+
+/// A software release has at most this many downloads.
+pub const MAX_DOWNLOADS: usize = 10;
+
+/// Download label limit (characters), as `game_release_files.label`.
+pub const MAX_LABEL_CHARS: usize = 80;
+
+/// What a manifest publishes: `[game]` or `[product]` (software).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Game,
+    Software,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Game => "game",
+            Kind::Software => "software",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
@@ -55,34 +96,76 @@ impl Channel {
 pub struct Manifest {
     /// The folder the manifest lives in.
     pub dir: PathBuf,
+    /// `[game]` or `[product]`.
+    pub kind: Kind,
     pub app_id: String,
     pub version: String,
     pub channel: Channel,
     /// File whose text becomes the release notes.
     pub notes: Option<PathBuf>,
-    /// The compiled rules module, for games the match host runs.
+    /// Games: the compiled rules module, for games the match host runs.
     pub rules: Option<PathBuf>,
-    /// One per platform, sorted by platform name.
+    /// Games: one per platform, sorted by platform name.
     pub clients: Vec<ClientSpec>,
+    /// Software: the files buyers download, in manifest order.
+    pub downloads: Vec<DownloadSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientSpec {
     pub platform: String,
-    /// A folder to zip, or a `.zip` to upload as it is.
+    /// A folder (sent file by file, or zipped), or a `.zip` to upload as it is.
     pub path: PathBuf,
-    /// Path of the executable inside the archive, `/`-separated.
+    /// Path of the executable inside the build, `/`-separated.
     pub entrypoint: String,
+    /// How a folder is sent: file by file (the default), or zipped.
+    pub delivery: Delivery,
+}
+
+/// How a client folder reaches Biome (spec §10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Delivery {
+    /// Each distinct file is an object the game stores once; updates fetch
+    /// only what changed. The default for a folder.
+    #[default]
+    Files,
+    /// One zip, uploaded and downloaded whole (a `.zip` path always is).
+    Zip,
+}
+
+/// One `[[download]]` of a software release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadSpec {
+    /// 1-based position in the manifest, for messages (`[[download]] #2`).
+    pub index: usize,
+    /// A file to upload as it is, or a folder to zip.
+    pub path: PathBuf,
+    /// `any` (the default) or one of [`PLATFORMS`].
+    pub platform: String,
+    /// Shown next to the file ("Add-on", "Docs"), trimmed.
+    pub label: Option<String>,
+    /// Publish under this name instead of the file's own (a folder: `<folder>.zip`).
+    pub file_name: Option<String>,
+}
+
+impl DownloadSpec {
+    /// `[[download]] #<n>`, for messages.
+    pub fn table(&self) -> String {
+        format!("[[download]] #{}", self.index)
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Raw {
-    game: RawGame,
+    game: Option<RawGame>,
+    product: Option<RawGame>,
     release: RawRelease,
     rules: Option<RawRules>,
     #[serde(default)]
     client: BTreeMap<String, RawClient>,
+    #[serde(default)]
+    download: Vec<RawDownload>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +193,16 @@ struct RawRules {
 struct RawClient {
     path: String,
     entrypoint: String,
+    delivery: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDownload {
+    path: String,
+    platform: Option<String>,
+    label: Option<String>,
+    file_name: Option<String>,
 }
 
 impl Manifest {
@@ -138,8 +231,21 @@ impl Manifest {
         let raw: Raw = toml::from_str(text).map_err(|e| Error::invalid(format!("biome.toml: {}", e.to_string().trim_end())))?;
         let mut problems = Vec::new();
 
-        if !is_app_id(&raw.game.app_id) {
-            problems.push(format!("[game] app_id {:?} must match ^[a-z0-9][a-z0-9-]{{2,63}}$", raw.game.app_id));
+        let (kind, table, app_id) = match (raw.game, raw.product) {
+            (Some(g), None) => (Kind::Game, "[game]", g.app_id),
+            (None, Some(p)) => (Kind::Software, "[product]", p.app_id),
+            (Some(g), Some(_)) => {
+                problems.push("[game] and [product] are both here: a manifest publishes a game or a software product".to_string());
+                (Kind::Game, "[game]", g.app_id)
+            }
+            (None, None) => {
+                return Err(Error::invalid(
+                    "biome.toml needs a [game] table (a game) or a [product] table (software: add-ons, plugins, tools) with its app_id",
+                ))
+            }
+        };
+        if !is_app_id(&app_id) {
+            problems.push(format!("{table} app_id {app_id:?} must match ^[a-z0-9][a-z0-9-]{{2,63}}$"));
         }
         if !is_semver(&raw.release.version) {
             problems.push(format!("[release] version {:?} must be semver MAJOR.MINOR.PATCH[-pre]", raw.release.version));
@@ -162,6 +268,10 @@ impl Manifest {
         };
         let rules = match raw.rules {
             None => None,
+            Some(_) if kind == Kind::Software => {
+                problems.push("[rules] is for games; a [product] release has [[download]] files only".to_string());
+                None
+            }
             Some(r) if r.wasm.is_empty() => {
                 problems.push("[rules] wasm is empty".to_string());
                 None
@@ -169,9 +279,61 @@ impl Manifest {
             Some(r) => Some(dir.join(r.wasm)),
         };
 
-        if raw.client.is_empty() {
-            problems.push("no [client.<platform>] table: a release needs at least one client build".to_string());
+        match kind {
+            Kind::Game => {
+                if raw.client.is_empty() {
+                    problems.push("no [client.<platform>] table: a release needs at least one client build".to_string());
+                }
+                if !raw.download.is_empty() {
+                    problems.push(
+                        "[[download]] is for software products: use [product] instead of [game], or ship [client.<platform>] builds"
+                            .to_string(),
+                    );
+                }
+            }
+            Kind::Software => {
+                if !raw.client.is_empty() {
+                    problems.push("[client.<platform>] tables are for games; a [product] release has [[download]] files".to_string());
+                }
+                if raw.download.is_empty() {
+                    problems.push("no [[download]]: a software release needs at least one file".to_string());
+                }
+                if raw.download.len() > MAX_DOWNLOADS {
+                    problems.push(format!("{} [[download]] entries; a release has at most {MAX_DOWNLOADS}", raw.download.len()));
+                }
+            }
         }
+
+        let mut downloads = Vec::new();
+        for (i, d) in raw.download.into_iter().enumerate() {
+            let table = format!("[[download]] #{}", i + 1);
+            if d.path.is_empty() {
+                problems.push(format!("{table} path is empty"));
+            }
+            let platform = d.platform.unwrap_or_else(|| "any".to_string());
+            if platform != "any" && !PLATFORMS.contains(&platform.as_str()) {
+                problems.push(format!("{table} platform {platform:?}: expected any, {}", PLATFORMS.join(", ")));
+            }
+            let label = match d.label.as_deref().map(str::trim) {
+                None => None,
+                Some("") => {
+                    problems.push(format!("{table} label is empty; leave it out or say what the file is"));
+                    None
+                }
+                Some(l) if l.chars().count() > MAX_LABEL_CHARS || l.chars().any(char::is_control) => {
+                    problems.push(format!("{table} label is at most {MAX_LABEL_CHARS} characters on one line"));
+                    None
+                }
+                Some(l) => Some(l.to_string()),
+            };
+            if let Some(name) = &d.file_name {
+                if !is_download_name(name) {
+                    problems.push(format!("{table} file_name {name:?} {DOWNLOAD_NAME_RULE}"));
+                }
+            }
+            downloads.push(DownloadSpec { index: i + 1, path: dir.join(&d.path), platform, label, file_name: d.file_name });
+        }
+
         let mut clients = Vec::new();
         for (platform, c) in raw.client {
             let table = format!("[client.{platform}]");
@@ -184,7 +346,20 @@ impl Manifest {
             if let Some(why) = entrypoint_problem(&c.entrypoint) {
                 problems.push(format!("{table} entrypoint {:?} {why}", c.entrypoint));
             }
-            clients.push(ClientSpec { platform, path: dir.join(&c.path), entrypoint: c.entrypoint });
+            let is_zip = Path::new(&c.path).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+            let delivery = match c.delivery.as_deref() {
+                None | Some("files") if !is_zip => Delivery::Files,
+                None | Some("zip") => Delivery::Zip,
+                Some("files") => {
+                    problems.push(format!("{table} delivery \"files\" needs a folder; a .zip is sent whole (point path at the folder)"));
+                    Delivery::Zip
+                }
+                Some(other) => {
+                    problems.push(format!("{table} delivery {other:?} must be \"files\" (the default for a folder) or \"zip\""));
+                    Delivery::Files
+                }
+            };
+            clients.push(ClientSpec { platform, path: dir.join(&c.path), entrypoint: c.entrypoint, delivery });
         }
 
         if !problems.is_empty() {
@@ -192,14 +367,46 @@ impl Manifest {
         }
         Ok(Manifest {
             dir: dir.to_path_buf(),
-            app_id: raw.game.app_id,
+            kind,
+            app_id,
             version: raw.release.version,
             channel,
             notes,
             rules,
             clients,
+            downloads,
         })
     }
+}
+
+/// What a published download's name may be.
+pub const DOWNLOAD_NAME_RULE: &str =
+    "must be 1-120 letters, digits, '.', '_' or '-', starting with a letter or digit";
+
+/// `^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$`: a download's name, which is also
+/// its storage key and what the buyer's browser saves it as.
+pub fn is_download_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    (1..=120).contains(&b.len())
+        && b[0].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+/// A publishable name close to `name`: other characters become `_`, runs of
+/// them collapse, leading dots and dashes go. `None` if nothing is left.
+pub fn suggest_download_name(name: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in name.chars() {
+        let keep = c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        if keep {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+    let out: String = out.chars().take(120).collect();
+    is_download_name(&out).then_some(out)
 }
 
 /// `^[a-z0-9][a-z0-9-]{2,63}$`, the `game_apps.app_id` check.
@@ -423,6 +630,130 @@ entrypoint = "bin/mecha-aether"
         assert!(msg.contains("version"), "{msg}");
         let msg = problems("[game\n");
         assert!(msg.starts_with("biome.toml:"), "{msg}");
+    }
+
+    const ADDON: &str = r#"
+[product]
+app_id = "node-wrangler"
+
+[release]
+version = "1.2.0"
+notes = "CHANGELOG.md"
+
+[[download]]
+path = "dist/node_wrangler-1.2.0.zip"
+label = "  Add-on (Blender 4.2+)  "
+
+[[download]]
+path = "dist/helper"
+platform = "windows-x64"
+file_name = "helper-win.zip"
+"#;
+
+    #[test]
+    fn parses_a_software_product() {
+        let m = parse(ADDON).unwrap();
+        assert_eq!(m.kind, Kind::Software);
+        assert_eq!(m.app_id, "node-wrangler");
+        assert_eq!(m.channel, Channel::Stable);
+        assert!(m.clients.is_empty() && m.rules.is_none());
+        assert_eq!(m.downloads.len(), 2);
+        let d = &m.downloads[0];
+        assert_eq!((d.index, d.platform.as_str()), (1, "any"), "platform defaults to any");
+        assert_eq!(d.path, Path::new("game").join("dist/node_wrangler-1.2.0.zip"));
+        assert_eq!(d.label.as_deref(), Some("Add-on (Blender 4.2+)"), "labels are trimmed");
+        assert_eq!(d.file_name, None);
+        assert_eq!(d.table(), "[[download]] #1");
+        let d = &m.downloads[1];
+        assert_eq!((d.platform.as_str(), d.file_name.as_deref(), d.label.as_deref()), ("windows-x64", Some("helper-win.zip"), None));
+    }
+
+    #[test]
+    fn game_manifests_parse_as_before() {
+        let m = parse(FULL).unwrap();
+        assert_eq!(m.kind, Kind::Game);
+        assert!(m.downloads.is_empty());
+    }
+
+    fn software(downloads: &str) -> String {
+        format!("[product]\napp_id = \"node-wrangler\"\n\n[release]\nversion = \"1.0.0\"\n\n{downloads}")
+    }
+
+    const ONE_DOWNLOAD: &str = "[[download]]\npath = \"addon.zip\"\n";
+
+    #[test]
+    fn a_manifest_is_a_game_or_software() {
+        let msg = problems(&format!("[game]\napp_id = \"abc\"\n{}", &software(ONE_DOWNLOAD)));
+        assert!(msg.contains("[game] and [product] are both here"), "{msg}");
+        let msg = problems("[release]\nversion = \"1.0.0\"\n");
+        assert!(msg.contains("[game]") && msg.contains("[product]"), "{msg}");
+        let msg = problems(&software(ONE_DOWNLOAD).replace("node-wrangler", "Node"));
+        assert!(msg.contains("[product] app_id \"Node\""), "{msg}");
+    }
+
+    #[test]
+    fn software_has_downloads_and_nothing_else() {
+        let msg = problems(&software(""));
+        assert!(msg.contains("no [[download]]"), "{msg}");
+        let msg = problems(&software(&format!("{ONE_DOWNLOAD}\n[rules]\nwasm = \"r.wasm\"\n")));
+        assert!(msg.contains("[rules] is for games"), "{msg}");
+        let msg = problems(&software(&format!("{ONE_DOWNLOAD}\n{ONE_CLIENT}")));
+        assert!(msg.contains("[client.<platform>] tables are for games"), "{msg}");
+        let msg = problems(&minimal("abc", "1.0.0", "", &format!("{ONE_CLIENT}\n{ONE_DOWNLOAD}")));
+        assert!(msg.contains("[[download]] is for software products"), "{msg}");
+        let eleven: String = (0..11).map(|i| format!("[[download]]\npath = \"f{i}.zip\"\n")).collect();
+        let msg = problems(&software(&eleven));
+        assert!(msg.contains("at most 10"), "{msg}");
+        let ten: String = (0..10).map(|i| format!("[[download]]\npath = \"f{i}.zip\"\n")).collect();
+        assert_eq!(parse(&software(&ten)).unwrap().downloads.len(), 10);
+    }
+
+    #[test]
+    fn download_fields_are_checked() {
+        let msg = problems(&software("[[download]]\npath = \"\"\nplatform = \"amiga\"\nlabel = \" \"\nfile_name = \".env\"\n"));
+        assert!(msg.contains("[[download]] #1 path is empty"), "{msg}");
+        assert!(msg.contains("[[download]] #1 platform \"amiga\""), "{msg}");
+        assert!(msg.contains("[[download]] #1 label is empty"), "{msg}");
+        assert!(msg.contains("[[download]] #1 file_name \".env\""), "{msg}");
+        let long = "x".repeat(81);
+        let msg = problems(&software(&format!("[[download]]\npath = \"a.zip\"\nlabel = \"{long}\"\n")));
+        assert!(msg.contains("label is at most 80"), "{msg}");
+        // Unknown keys are typos, not silently ignored.
+        let msg = problems(&software("[[download]]\npath = \"a.zip\"\nlable = \"Add-on\"\n"));
+        assert!(msg.contains("lable"), "{msg}");
+        for p in PLATFORMS {
+            let m = parse(&software(&format!("[[download]]\npath = \"a.zip\"\nplatform = \"{p}\"\n"))).unwrap();
+            assert_eq!(m.downloads[0].platform, p);
+        }
+    }
+
+    #[test]
+    fn download_names() {
+        for ok in ["addon.zip", "a", "Node_Wrangler-1.2.0.tar.gz", "README", "9.py", &"a".repeat(120)] {
+            assert!(is_download_name(ok), "{ok}");
+        }
+        for bad in ["", ".env", "..", "-x", "_x", "a b.zip", "a/b", "é.zip", &"a".repeat(121)] {
+            assert!(!is_download_name(bad), "{bad}");
+        }
+        assert_eq!(suggest_download_name("My Addon (v2).zip").as_deref(), Some("My_Addon_v2_.zip"));
+        assert_eq!(suggest_download_name(".hidden").as_deref(), Some("hidden"));
+        assert_eq!(suggest_download_name("ñandú.py").as_deref(), Some("and_.py"));
+        assert_eq!(suggest_download_name("...").as_deref(), None);
+    }
+
+    #[test]
+    fn a_folder_goes_file_by_file_unless_it_says_zip() {
+        let m = parse(FULL).unwrap();
+        // linux-x64 is dist/linux.zip, windows-x64 the folder dist/windows.
+        assert_eq!((m.clients[0].delivery, m.clients[1].delivery), (Delivery::Zip, Delivery::Files));
+        let zipped = parse(&minimal("abc", "1.0.0", "", "[client.windows-x64]\npath = \"dist\"\nentrypoint = \"g\"\ndelivery = \"zip\"\n")).unwrap();
+        assert_eq!(zipped.clients[0].delivery, Delivery::Zip);
+        let files = parse(&minimal("abc", "1.0.0", "", "[client.windows-x64]\npath = \"dist\"\nentrypoint = \"g\"\ndelivery = \"files\"\n")).unwrap();
+        assert_eq!(files.clients[0].delivery, Delivery::Files);
+        let msg = problems(&minimal("abc", "1.0.0", "", "[client.windows-x64]\npath = \"g.zip\"\nentrypoint = \"g\"\ndelivery = \"files\"\n"));
+        assert!(msg.contains("needs a folder"), "{msg}");
+        let msg = problems(&minimal("abc", "1.0.0", "", "[client.windows-x64]\npath = \"dist\"\nentrypoint = \"g\"\ndelivery = \"rsync\"\n"));
+        assert!(msg.contains("delivery \"rsync\""), "{msg}");
     }
 
     #[test]

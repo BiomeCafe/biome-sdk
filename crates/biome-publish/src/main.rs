@@ -1,8 +1,10 @@
 //! # biome-publish
 //!
-//! Publishes a game release to Biome from the game's own repository,
-//! usually from its CI. Contract: `docs/GAME_PUBLISHING_SPEC.md` §3 (the
-//! `game-publish` API), §4 (storage) and §7 (this tool).
+//! Publishes a release to Biome from the product's own repository, usually
+//! from its CI: a game, or a software product (an add-on, a plugin, a
+//! tool). Contract: `docs/GAME_PUBLISHING_SPEC.md` §3 (the `game-publish`
+//! API), §4 (storage) and §7 (this tool); `docs/SOFTWARE_PRODUCTS_SPEC.md`
+//! for software.
 //!
 //! ## Manifest
 //!
@@ -21,8 +23,38 @@
 //! wasm = "target/wasm32-unknown-unknown/release/mecha_rules.wasm"
 //!
 //! [client.windows-x64]       # one table per platform: windows-x64, macos-arm64, macos-x64, linux-x64
-//! path = "dist/windows"      # a folder (zipped by the CLI) or a .zip (uploaded as is)
-//! entrypoint = "MechaAether.exe"  # the executable inside the archive, / separated
+//! path = "dist/windows"      # a folder (sent file by file) or a .zip (uploaded as is)
+//! entrypoint = "MechaAether.exe"  # the executable inside the build, / separated
+//! # delivery = "zip"         # optional: zip the folder and send it whole instead
+//! ```
+//!
+//! A client folder is sent file by file (spec §10): each distinct file is
+//! an object the game stores once on Biome, so a new version uploads only the
+//! files that changed ("312 of 331 files already on Biome; uploading 19
+//! (34.2 MB)") and players' updates download only those. Ship assets as
+//! files, not packed into one archive, to benefit.
+//!
+//! A software product, or a shop file listing, has `[product]` instead of
+//! `[game]`, no `[rules]` or `[client.*]`, and 1 to 10 downloads. The
+//! server knows which kind the app id is: software takes any file type and
+//! is reviewed; a file listing takes plain files (documents, pictures, 3D
+//! and print files, audio, video) and zips of them, and goes live once its
+//! files scan clean for viruses when the server's look inside finds nothing
+//! that can run (else it waits for a site admin, and `upload` prints why).
+//! Every release's files are scanned; `status` shows the scan:
+//!
+//! ```toml
+//! [product]
+//! app_id = "node-wrangler"
+//!
+//! [release]
+//! version = "1.2.0"
+//!
+//! [[download]]
+//! path = "dist/node_wrangler-1.2.0.zip"  # a file (uploaded as is) or a folder (zipped, contents at the root)
+//! platform = "any"                       # default; or windows-x64, macos-arm64, macos-x64, linux-x64
+//! label = "Add-on"                       # optional, shown next to the file
+//! # file_name = "..."                    # optional: publish under another name
 //! ```
 //!
 //! ## Commands
@@ -35,16 +67,20 @@
 //!
 //! - `check` validates the manifest, loads the rules module with the match
 //!   host's own validator (`biome_rules_host::validate`) and prints its
-//!   meta, zips each client folder deterministically (sorted entries, fixed
-//!   timestamps, so the same folder always gives the same sha256), checks
-//!   the entrypoint is in the archive, and prints sizes and hashes. No
-//!   network. Zips go to `--out-dir`, default
+//!   meta, hashes each client folder's files and checks their names (or,
+//!   with `delivery = "zip"`, zips it deterministically: sorted entries,
+//!   fixed timestamps, so the same folder always gives the same sha256),
+//!   checks the entrypoint is in the build, and prints sizes, hashes and
+//!   build ids. No network. Zips go to `--out-dir`, default
 //!   `<temp>/biome-publish/<app_id>/<version>/`, named
 //!   `<app_id>-<version>-<platform>.zip`.
 //! - `upload` runs `check`, creates the release, streams every file to the
 //!   presigned URL the server returns (with exactly the headers it
-//!   returns), then submits the release for review. Re-running it after a
-//!   failed upload resumes the release while it is still `uploading`.
+//!   returns), then submits the release for review. For a per-file client
+//!   it compresses (deterministic gzip, in `--out-dir/objects`) and uploads
+//!   only the files Biome doesn't have, 8 at a time. Re-running it after a
+//!   failed upload resumes the release while it is still `uploading`; files
+//!   that made it are not sent again.
 //! - `status` lists the game's 20 most recent releases and their review
 //!   state.
 //!

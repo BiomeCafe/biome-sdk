@@ -20,12 +20,17 @@
 //!
 //! and a second Biome account on another machine joins with `--join <CODE>`.
 //!
+//! **Matchmaking**: `--queue casual` (or `--queue ranked`) instead of
+//! `--create` / `--join` waits in the queue until another player (another
+//! bot with a different account) is paired with it. `--open` creates a
+//! listed match; `--join-open` takes the newest listed one.
+//!
 //! The bot picks a random legal move each turn, using the same rules crate
 //! the host runs (`rules-tictactoe`), and prints the board as it goes.
 
 use std::time::Duration;
 
-use biome_online_services::match_client::{Entry, MatchClient, MatchEndpoint, MatchEvent};
+use biome_online_services::match_client::{list_open, Entry, MatchClient, MatchEndpoint, MatchEvent};
 use biome_online_services::{detect, BiomeClient, BosConfig};
 use biome_rules::{LegalMoves, Rng, Rules, Seat};
 use rules_tictactoe::{TicTacToe, View};
@@ -37,11 +42,14 @@ struct Args {
     dev_user: Option<String>,
     join: Option<String>,
     create: bool,
+    queue: Option<String>,
+    open: bool,
+    join_open: bool,
     delay_ms: u64,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { url: "http://127.0.0.1:8787".into(), dev_user: None, join: None, create: false, delay_ms: 400 };
+    let mut a = Args { url: "http://127.0.0.1:8787".into(), dev_user: None, join: None, create: false, queue: None, open: false, join_open: false, delay_ms: 400 };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         match flag.as_str() {
@@ -49,12 +57,15 @@ fn parse_args() -> Args {
             "--dev-user" => a.dev_user = it.next(),
             "--join" => a.join = it.next(),
             "--create" => a.create = true,
+            "--queue" => a.queue = it.next(),
+            "--open" => a.open = true,
+            "--join-open" => a.join_open = true,
             "--delay-ms" => a.delay_ms = it.next().and_then(|s| s.parse().ok()).unwrap_or(400),
             other => eprintln!("ignoring unknown flag {other}"),
         }
     }
-    if !a.create && a.join.is_none() {
-        eprintln!("say --create or --join <CODE>");
+    if !a.create && a.join.is_none() && a.queue.is_none() && !a.open && !a.join_open {
+        eprintln!("say --create, --join <CODE>, --queue <MODE>, --open or --join-open");
         std::process::exit(2);
     }
     a
@@ -103,11 +114,41 @@ fn draw(view: &View) {
 fn main() {
     let args = parse_args();
     let ticket = ticket(&args);
-    let entry = match &args.join {
-        Some(code) => Entry::Join { code: code.clone() },
-        None => Entry::Create { config: Vec::new(), clock: None },
+    let endpoint = MatchEndpoint::new(args.url.clone(), APP_ID, TicTacToe::VERSION);
+    let entry = if let Some(code) = &args.join {
+        Entry::Join { code: code.clone() }
+    } else if let Some(mode) = &args.queue {
+        Entry::Queue { mode: mode.clone(), config: Vec::new(), clock: None }
+    } else if args.open {
+        Entry::Open { config: Vec::new(), clock: None }
+    } else if args.join_open {
+        let listing = list_open(&endpoint);
+        let result = loop {
+            if let Some(r) = listing.poll() {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        match result {
+            Ok(open) => match open.first() {
+                Some(m) => {
+                    println!("joining {}'s open match {}", m.host, m.match_id);
+                    Entry::JoinOpen { match_id: m.match_id.clone() }
+                }
+                None => {
+                    eprintln!("no open matches");
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("could not list open matches: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Entry::Create { config: Vec::new(), clock: None }
     };
-    let client = MatchClient::start(MatchEndpoint::new(args.url.clone(), APP_ID, TicTacToe::VERSION), ticket, entry);
+    let client = MatchClient::start(endpoint, ticket, entry);
 
     // Bot randomness only; the host's randomness is its own.
     let mut seed = [0u8; 32];
@@ -176,6 +217,10 @@ fn main() {
                 std::process::exit(1);
             }
             MatchEvent::Error { code, detail } => println!("host error: {code} {detail}"),
+            MatchEvent::Queued { mode, waiting, rating } => match rating {
+                Some(r) => println!("in the {mode} queue ({waiting} waiting), rating {:.0} ± {:.0} after {} matches", r.rating, r.deviation, r.matches),
+                None => println!("in the {mode} queue ({waiting} waiting)"),
+            },
             MatchEvent::Failed { code, message } => {
                 eprintln!("could not get a seat: {code} {message}");
                 std::process::exit(1);

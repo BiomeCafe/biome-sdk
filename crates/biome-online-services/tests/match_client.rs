@@ -10,8 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use biome_match_dev::Host;
-use biome_online_services::match_client::{ClockConfig, Entry, MatchClient, MatchEndpoint, MatchEvent, SeatedInfo, Update, Welcome};
+use biome_match_dev::{Host, WindowRule, RANKED_WINDOW};
+use biome_online_services::match_client::{
+    list_open, ClockConfig, Entry, MatchClient, MatchEndpoint, MatchEvent, OpenListing, OpenMatch, Rating, SeatedInfo, Update, Welcome,
+};
 use biome_rules::{codec, Rules};
 use biome_rules_host::RulesModule;
 use rules_highcard::HighCard;
@@ -44,14 +46,19 @@ impl Drop for Server {
 }
 
 fn server() -> Server {
+    server_with(|h| h)
+}
+
+/// A dev host with extra settings (seeded ratings, a faster ranked window).
+fn server_with(configure: impl FnOnce(Host) -> Host) -> Server {
     // highcard allows self-play here (as both demo games do in production);
     // tictactoe does not, so both behaviours are covered.
-    let host = Arc::new(
+    let host = Arc::new(configure(
         Host::new()
             .add_rules("tictactoe", bundled("tictactoe", TicTacToe::VERSION))
             .add_rules("highcard", bundled("highcard", HighCard::VERSION))
             .allow_self_play("highcard"),
-    );
+    ));
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let host_for_thread = host.clone();
@@ -493,4 +500,261 @@ fn welcome_or_clock(c: &MatchClient) -> Option<u64> {
     c.sync();
     let w = wait_for(c, "Welcome", |e| match e { MatchEvent::Welcome(w) => Some(w), _ => None });
     w.clock.and_then(|m| m.get(&0).copied())
+}
+
+// â”€â”€ matchmaking, open matches, ranked â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+fn queue_entry(mode: &str, config: Vec<u8>) -> Entry {
+    Entry::Queue { mode: mode.into(), config, clock: None }
+}
+
+fn queued(c: &MatchClient) -> (String, u32, Option<Rating>) {
+    wait_for(c, "Queued", |e| match e {
+        MatchEvent::Queued { mode, waiting, rating } => Some((mode, waiting, rating)),
+        MatchEvent::Failed { code, message } => panic!("failed: {code} {message}"),
+        _ => None,
+    })
+}
+
+fn failed(c: &MatchClient) -> (String, String) {
+    wait_for(c, "Failed", |e| match e { MatchEvent::Failed { code, message } => Some((code, message)), _ => None })
+}
+
+/// Watch `c` for `d` and fail if it gets a seat meanwhile.
+fn stays_queued(c: &MatchClient, d: Duration) {
+    let deadline = Instant::now() + d;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        if let Some(ev) = c.wait_event(left) {
+            assert!(!matches!(ev, MatchEvent::Seated(_) | MatchEvent::Failed { .. }), "expected to stay queued, got {ev:?}");
+        }
+    }
+}
+
+/// The listing's one result; `poll` stays `None` afterwards.
+fn listing(l: OpenListing) -> Vec<OpenMatch> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(r) = l.poll() {
+            assert!(l.poll().is_none(), "poll answers once");
+            return r.unwrap_or_else(|e| panic!("listing failed: {e}"));
+        }
+        assert!(Instant::now() < deadline, "listing timed out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn until(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn two_casual_players_are_paired_and_play_tictactoe() {
+    let s = server();
+    let ep = endpoint(&s, "tictactoe", TicTacToe::VERSION);
+    let a = MatchClient::start(ep.clone(), "dev:user-a:mandy", queue_entry("casual", Vec::new()));
+    assert_eq!(queued(&a), ("casual".to_string(), 1, None));
+    assert_eq!(s.host.queue_len("tictactoe", "casual", TicTacToe::VERSION), 1);
+
+    let b = MatchClient::start(ep, "dev:user-b:rex", queue_entry("casual", Vec::new()));
+    let ia = seated(&a);
+    let ib = seated(&b);
+    assert_eq!(ia.match_id, ib.match_id);
+    assert_eq!((ia.join_code.as_deref(), ib.join_code.as_deref()), (None, None));
+    let mut seats = [ia.seat, ib.seat];
+    seats.sort();
+    assert_eq!(seats, [0, 1]);
+    assert_eq!(s.host.queue_len("tictactoe", "casual", TicTacToe::VERSION), 0);
+    assert_eq!(s.host.match_mode("tictactoe", &ia.match_id).as_deref(), Some("casual"));
+
+    // From here it is an ordinary match.
+    welcome(&a, "active");
+    welcome(&b, "active");
+    let (first, second) = if ia.seat == 0 { (&a, &b) } else { (&b, &a) };
+    let mut seq = 0;
+    for (who, cell) in [(first, 0u8), (second, 3), (first, 1), (second, 4), (first, 2)] {
+        place(who, cell);
+        seq += 1;
+        update(&a, seq);
+        update(&b, seq);
+    }
+    for c in [&a, &b] {
+        let outcome = wait_for(c, "Over", |e| match e { MatchEvent::Over { outcome } => Some(outcome), _ => None });
+        assert_eq!(outcome.winners, vec![biome_rules::Seat(0)]);
+    }
+    // Casual: nobody's rating moved.
+    assert_eq!(s.host.rating("tictactoe", "user-a", "ranked").matches, 0);
+}
+
+#[test]
+fn ranked_pairs_only_inside_the_rating_windows() {
+    // Windows widen every 400 ms instead of 10 s: 200 points apart needs
+    // Â±200, six steps, so about 2.4 s.
+    let s = server_with(|h| {
+        h.seed_rating("user-a", 1500.0).seed_rating("user-b", 1700.0).with_ranked_window(WindowRule { every_ms: 400, ..RANKED_WINDOW })
+    });
+    let ep = endpoint(&s, "tictactoe", TicTacToe::VERSION);
+    let a = MatchClient::start(ep.clone(), "dev:user-a:mandy", queue_entry("ranked", Vec::new()));
+    let (mode, waiting, rating) = queued(&a);
+    assert_eq!((mode.as_str(), waiting), ("ranked", 1));
+    assert_eq!(rating, Some(Rating { rating: 1500.0, deviation: 350.0, matches: 0 }));
+    let b = MatchClient::start(ep, "dev:user-b:rex", queue_entry("ranked", Vec::new()));
+    let (_, waiting, rating) = queued(&b);
+    assert_eq!(waiting, 2);
+    assert_eq!(rating.map(|r| r.rating), Some(1700.0));
+
+    // Not at once...
+    stays_queued(&a, Duration::from_millis(600));
+    assert_eq!(s.host.queue_len("tictactoe", "ranked", TicTacToe::VERSION), 2);
+    // ...but once the windows have widened.
+    let ia = seated(&a);
+    let ib = seated(&b);
+    assert_eq!(ia.match_id, ib.match_id);
+    assert_eq!(s.host.match_mode("tictactoe", &ia.match_id).as_deref(), Some("ranked"));
+
+    // The favourite resigns on its turn.
+    welcome(&a, "active");
+    welcome(&b, "active");
+    if ib.seat != 0 {
+        place(&a, 4);
+        update(&b, 1);
+    }
+    b.send_typed::<TicTacToe>(&rules_tictactoe::Move::Resign).unwrap();
+    for c in [&a, &b] {
+        wait_for(c, "Over", |e| matches!(e, MatchEvent::Over { .. }).then_some(()));
+    }
+    let ra = s.host.rating("tictactoe", "user-a", "ranked");
+    let rb = s.host.rating("tictactoe", "user-b", "ranked");
+    assert_eq!((ra.matches, ra.wins, rb.matches, rb.losses), (1, 1, 1, 1));
+    assert!(ra.rating > 1500.0 && rb.rating < 1700.0, "{ra:?} {rb:?}");
+    assert!(ra.deviation < 350.0);
+}
+
+#[test]
+fn far_apart_ranked_players_are_not_paired_at_production_speed() {
+    let s = server_with(|h| h.seed_rating("user-a", 1500.0).seed_rating("user-b", 1900.0));
+    let ep = endpoint(&s, "tictactoe", TicTacToe::VERSION);
+    let a = MatchClient::start(ep.clone(), "dev:user-a:mandy", queue_entry("ranked", Vec::new()));
+    queued(&a);
+    let b = MatchClient::start(ep.clone(), "dev:user-b:rex", queue_entry("ranked", Vec::new()));
+    queued(&b);
+    stays_queued(&a, Duration::from_millis(800));
+    // A close rating gets in right away.
+    let c = MatchClient::start(ep, "dev:user-c:kit", queue_entry("ranked", Vec::new()));
+    let ia = seated(&a);
+    assert_eq!(seated(&c).match_id, ia.match_id);
+    stays_queued(&b, Duration::from_millis(300));
+}
+
+#[test]
+fn open_matches_are_listed_and_joined_by_id() {
+    let s = server();
+    let ep = endpoint(&s, "tictactoe", TicTacToe::VERSION);
+    assert!(listing(list_open(&ep)).is_empty());
+
+    let host = MatchClient::start(ep.clone(), "dev:user-a:mandy", Entry::Open { config: Vec::new(), clock: None });
+    let info = seated(&host);
+    assert_eq!(info.seat, 0);
+    assert!(info.join_code.is_some(), "an open match also gets a code");
+    // A private match is not listed.
+    let private = MatchClient::start(ep.clone(), "dev:user-c:kit", Entry::Create { config: Vec::new(), clock: None });
+    let private_info = seated(&private);
+
+    let open = listing(list_open(&ep));
+    assert_eq!(open.len(), 1);
+    assert_eq!((open[0].match_id.as_str(), open[0].host.as_str(), open[0].rules_version.as_str()), (info.match_id.as_str(), "mandy", "1.0.0"));
+    assert!(open[0].config.is_empty() && open[0].created_at_ms > 0);
+    assert!(listing(list_open(&endpoint(&s, "tictactoe", "9.9.9"))).is_empty());
+
+    let joiner = MatchClient::start(ep.clone(), "dev:user-b:rex", Entry::JoinOpen { match_id: info.match_id.clone() });
+    let joined = seated(&joiner);
+    assert_eq!((joined.seat, joined.join_code.as_deref(), joined.match_id.as_str()), (1, None, info.match_id.as_str()));
+    welcome(&host, "active");
+    welcome(&joiner, "active");
+    // Started: off the list, and its seat is gone.
+    assert!(listing(list_open(&ep)).is_empty());
+    let late = MatchClient::start(ep.clone(), "dev:user-d:dot", Entry::JoinOpen { match_id: info.match_id.clone() });
+    assert_eq!(failed(&late).0, "match-started");
+    // A private match cannot be joined by its id.
+    let sneak = MatchClient::start(ep, "dev:user-d:dot", Entry::JoinOpen { match_id: private_info.match_id });
+    assert_eq!(failed(&sneak).0, "no-such-match");
+}
+
+#[test]
+fn dropping_a_queued_client_leaves_the_queue() {
+    let s = server();
+    let ep = endpoint(&s, "tictactoe", TicTacToe::VERSION);
+    let a = MatchClient::start(ep.clone(), "dev:user-a:mandy", queue_entry("casual", Vec::new()));
+    queued(&a);
+    drop(a);
+    until("the queue to empty", || s.host.queue_len("tictactoe", "casual", TicTacToe::VERSION) == 0);
+
+    // Nobody is left for the next player.
+    let b = MatchClient::start(ep.clone(), "dev:user-b:rex", queue_entry("casual", Vec::new()));
+    assert_eq!(queued(&b).1, 1);
+    stays_queued(&b, Duration::from_millis(400));
+    let c = MatchClient::start(ep, "dev:user-c:kit", queue_entry("casual", Vec::new()));
+    assert_eq!(seated(&b).match_id, seated(&c).match_id);
+}
+
+#[test]
+fn different_configs_modes_and_rules_versions_are_never_paired() {
+    let s = server();
+    let ep = endpoint(&s, "highcard", HighCard::VERSION);
+    let cfg = |hand_size: u8, rounds: u8| codec::encode(&rules_highcard::Config { hand_size, rounds }).unwrap();
+    let a = MatchClient::start(ep.clone(), "dev:user-a:mandy", queue_entry("casual", cfg(3, 5)));
+    let b = MatchClient::start(ep.clone(), "dev:user-b:rex", queue_entry("casual", cfg(3, 4)));
+    let c = MatchClient::start(ep.clone(), "dev:user-c:kit", queue_entry("blitz", cfg(3, 5)));
+    let d = MatchClient::start(
+        ep.clone(),
+        "dev:user-d:dot",
+        Entry::Queue { mode: "casual".into(), config: cfg(3, 5), clock: Some(ClockConfig { initial_ms: 60_000, increment_ms: 0 }) },
+    );
+    for client in [&a, &b, &c, &d] {
+        assert_eq!(queued(client).1, 1, "alone in its pool");
+    }
+    for client in [&a, &b, &c, &d] {
+        stays_queued(client, Duration::from_millis(150));
+    }
+    // Another rules version is another queue; one this host doesn't run is refused.
+    let v = MatchClient::start(endpoint(&s, "highcard", "9.9.9"), "dev:user-e:eve", queue_entry("casual", cfg(3, 5)));
+    assert_eq!(failed(&v).0, "unknown-rules");
+
+    // The same config, mode and clock as `a` pairs with `a` only.
+    let e = MatchClient::start(ep, "dev:user-e:eve", queue_entry("casual", cfg(3, 5)));
+    assert_eq!(seated(&a).match_id, seated(&e).match_id);
+    for client in [&b, &c, &d] {
+        stays_queued(client, Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn queue_refusals_are_reported_as_failed() {
+    let s = server();
+    let ep = endpoint(&s, "highcard", HighCard::VERSION);
+    let bad_ticket = MatchClient::start(ep.clone(), "not-a-dev-ticket", queue_entry("casual", Vec::new()));
+    assert_eq!(failed(&bad_ticket).0, "unauthorized");
+    wait_for(&bad_ticket, "Disconnected(final)", |e| matches!(e, MatchEvent::Disconnected { reconnecting: false }).then_some(()));
+
+    let bad_mode = MatchClient::start(ep.clone(), "dev:user-a:mandy", queue_entry("Ranked!", Vec::new()));
+    assert_eq!(failed(&bad_mode).0, "bad-mode");
+
+    let cfg = codec::encode(&rules_highcard::Config { hand_size: 0, rounds: 3 }).unwrap();
+    let bad_config = MatchClient::start(ep.clone(), "dev:user-a:mandy", queue_entry("casual", cfg));
+    assert_eq!(failed(&bad_config).0, "bad-config");
+
+    // A newer queue entry by the same player replaces the older one.
+    let ok = codec::encode(&rules_highcard::Config { hand_size: 3, rounds: 5 }).unwrap();
+    let first = MatchClient::start(ep.clone(), "dev:user-a:mandy", queue_entry("casual", ok.clone()));
+    queued(&first);
+    let second = MatchClient::start(ep, "dev:user-a:mandy", queue_entry("casual", ok));
+    queued(&second);
+    assert_eq!(failed(&first).0, "replaced");
 }

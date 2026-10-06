@@ -31,20 +31,39 @@ use biome_rules_host::RulesModule;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+pub mod glicko2;
 mod http;
+pub mod pairing;
 pub use http::{router, serve};
+pub use pairing::{WindowRule, RANKED_WINDOW};
 
 pub const WAITING_TTL_MS: i64 = 30 * 60 * 1000;
 pub const MAX_MOVE_BYTES: usize = 64 * 1024;
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+/// Listed matches show their config to everyone browsing.
+pub const MAX_LISTED_CONFIG_BYTES: usize = 8 * 1024;
+pub const MAX_OPEN_RESULTS: usize = 50;
+/// A player still waiting after this long is told `queue-timeout`.
+pub const QUEUE_TIMEOUT_MS: i64 = 10 * 60 * 1000;
+/// A queued player hears about its pool's size at most this often.
+pub const NOTIFY_INTERVAL_MS: i64 = 1000;
+/// A queue socket must say hello within this long.
+pub const HELLO_TIMEOUT_MS: i64 = 15 * 1000;
+/// Queue joins per user and game, per window.
+pub const QUEUE_JOIN_LIMIT: u32 = 20;
+pub const QUEUE_JOIN_WINDOW_MS: i64 = 5 * 60 * 1000;
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const CODE_LENGTH: usize = 6;
 
+const CLOSE_PAIRED: u16 = 1000;
+const CLOSE_BACKEND: u16 = 1011;
 const CLOSE_REPLACED: u16 = 4000;
 const CLOSE_PROTOCOL: u16 = 4400;
 const CLOSE_BAD_TOKEN: u16 = 4401;
+const CLOSE_TIMEOUT: u16 = 4408;
 const CLOSE_VERSION: u16 = 4409;
 const CLOSE_ENDED: u16 = 4410;
+const CLOSE_RATE: u16 = 4429;
 
 /// Something to deliver to one socket.
 #[derive(Clone, Debug, PartialEq)]
@@ -82,10 +101,146 @@ impl Status {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Clock {
     initial_ms: i64,
     increment_ms: i64,
+}
+
+/// `None` / `null` is no clock; `Err` an invalid one.
+fn parse_clock(v: Option<&Value>) -> Result<Option<Clock>, ()> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(c) => {
+            let initial = c.get("initial_ms").and_then(Value::as_i64);
+            let increment = c.get("increment_ms").and_then(Value::as_i64);
+            match (initial, increment) {
+                (Some(i), Some(inc)) if (1000..=7 * 24 * 3_600_000).contains(&i) && (0..=24 * 3_600_000).contains(&inc) => {
+                    Ok(Some(Clock { initial_ms: i, increment_ms: inc }))
+                }
+                _ => Err(()),
+            }
+        }
+    }
+}
+
+/// A player's rating in one game and mode (Glicko-2), kept in memory.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RatingRow {
+    pub rating: f64,
+    pub deviation: f64,
+    pub volatility: f64,
+    pub matches: u32,
+    pub wins: u32,
+    pub losses: u32,
+    pub draws: u32,
+}
+
+impl RatingRow {
+    fn fresh(rating: f64) -> Self {
+        let d = glicko2::Glicko::default();
+        Self { rating, deviation: d.deviation, volatility: d.volatility, matches: 0, wins: 0, losses: 0, draws: 0 }
+    }
+
+    fn glicko(&self) -> glicko2::Glicko {
+        glicko2::Glicko { rating: self.rating, deviation: self.deviation, volatility: self.volatility }
+    }
+
+    fn after(&self, g: glicko2::Glicko, score: f64) -> Self {
+        Self {
+            rating: g.rating,
+            deviation: g.deviation,
+            volatility: g.volatility,
+            matches: self.matches + 1,
+            wins: self.wins + u32::from(score == 1.0),
+            losses: self.losses + u32::from(score == 0.0),
+            draws: self.draws + u32::from(score == 0.5),
+        }
+    }
+
+    fn public(&self) -> Value {
+        json!({ "rating": self.rating, "deviation": self.deviation, "matches": self.matches })
+    }
+}
+
+/// Queue modes: lowercase letters, digits and dashes, at most 32.
+pub fn valid_mode(mode: &str) -> bool {
+    let b = mode.as_bytes();
+    !b.is_empty()
+        && b.len() <= 32
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// `dev:<user id>:<username>`: the dev host's stand-in for a ticket. The
+/// username may contain colons; the user id may not.
+pub fn parse_dev_ticket(token: &str) -> Option<User> {
+    let rest = token.trim().strip_prefix("dev:")?;
+    let (user_id, username) = rest.split_once(':')?;
+    if user_id.is_empty() || username.is_empty() || username.len() > 80 {
+        return None;
+    }
+    Some(User { user_id: user_id.to_string(), username: username.to_string() })
+}
+
+/// One queue: a game, a mode and a rules version.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct QueueKey {
+    app: String,
+    mode: String,
+    rules_version: String,
+}
+
+#[derive(Clone)]
+struct Waiter {
+    user: User,
+    config: Vec<u8>,
+    clock: Option<Clock>,
+    /// Config + clock: only the same pool can be paired.
+    pool: String,
+    joined_at: i64,
+    order: u64,
+    rating: Option<RatingRow>,
+    /// The `waiting` count last sent, and when.
+    told: u32,
+    told_at: i64,
+}
+
+struct QueueConn {
+    id: u64,
+    key: QueueKey,
+    tx: UnboundedSender<Out>,
+    open: bool,
+    opened_at: i64,
+    waiter: Option<Waiter>,
+}
+
+impl QueueConn {
+    fn send(&self, frame: Value) {
+        if self.open {
+            let _ = self.tx.send(Out::Frame(frame.to_string()));
+        }
+    }
+
+    fn close(&mut self, code: u16, reason: &str) {
+        if self.open {
+            let _ = self.tx.send(Out::Close(code, reason.to_string()));
+            self.open = false;
+        }
+        self.waiter = None;
+    }
+
+    /// An error frame, then close.
+    fn refuse(&mut self, code: &str, close: u16, extra: Value) {
+        let mut frame = json!({ "t": "error", "code": code });
+        if let (Some(f), Some(e)) = (frame.as_object_mut(), extra.as_object()) {
+            for (k, v) in e {
+                f.insert(k.clone(), v.clone());
+            }
+        }
+        self.send(frame);
+        self.close(close, code);
+    }
 }
 
 struct SeatRow {
@@ -133,6 +288,15 @@ struct Match {
     clock_failures: u32,
     clock_retry_at: i64,
     log: Vec<LogEntry>,
+    /// The queue mode that made it ("ranked", …), or "casual".
+    mode: String,
+    /// Opened with `listed: true`: anyone may take a seat by its id.
+    listed: bool,
+    /// On the open list right now (off once it starts, is abandoned, or its
+    /// host lists a newer match).
+    shown: bool,
+    /// Its result went into the ratings (or was looked at and not rated).
+    rated: bool,
 }
 
 struct Inner {
@@ -140,6 +304,12 @@ struct Inner {
     /// (app, code) → match key
     codes: HashMap<(String, String), String>,
     next_conn: u64,
+    queues: Vec<QueueConn>,
+    next_order: u64,
+    /// (app, user id, mode) → rating
+    ratings: HashMap<(String, String, String), RatingRow>,
+    /// (app, user id) → (queue joins, end of the window)
+    queue_joins: HashMap<(String, String), (u32, i64)>,
 }
 
 /// The dev host: registered rules modules and every live match.
@@ -150,6 +320,10 @@ pub struct Host {
     inner: Mutex<Inner>,
     /// Milliseconds since the epoch; replaceable so tests can drive clocks.
     now: Box<dyn Fn() -> i64 + Send + Sync>,
+    /// user id → starting rating (`--rating`), for players not yet rated.
+    seeds: HashMap<String, f64>,
+    /// How ranked windows widen ([`RANKED_WINDOW`] unless set).
+    window: WindowRule,
 }
 
 fn system_now() -> i64 {
@@ -175,6 +349,50 @@ fn fresh_seed() -> [u8; 32] {
 
 fn random_token() -> String {
     format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+}
+
+/// One random bit from the OS generator.
+fn coin() -> bool {
+    uuid::Uuid::new_v4().as_bytes()[0] & 1 == 1
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_match(app: &str, version: &str, rules: Arc<RulesModule>, config: Vec<u8>, clock: Option<Clock>, mode: &str, listed: bool, now: i64) -> Match {
+    Match {
+        match_id: uuid::Uuid::new_v4().to_string(),
+        app_id: app.to_string(),
+        rules_version: version.to_string(),
+        rules,
+        config,
+        status: Status::Waiting,
+        created_at: now,
+        clock,
+        seats: Vec::new(),
+        state: None,
+        seq: 0,
+        to_move: Vec::new(),
+        since: HashMap::new(),
+        outcome: None,
+        conns: Vec::new(),
+        clock_failures: 0,
+        clock_retry_at: 0,
+        log: Vec::new(),
+        mode: mode.to_string(),
+        listed,
+        shown: listed,
+        rated: false,
+    }
+}
+
+fn seat_row(seat: u8, user: &User, token: &str, clock: Option<Clock>) -> SeatRow {
+    SeatRow {
+        seat,
+        user_id: user.user_id.clone(),
+        username: user.username.clone(),
+        token: token.to_string(),
+        remaining_ms: clock.map(|c| c.initial_ms),
+        last_client_seq: 0,
+    }
 }
 
 fn random_code() -> String {
@@ -213,8 +431,18 @@ impl Host {
         Self {
             modules: HashMap::new(),
             self_play: HashSet::new(),
-            inner: Mutex::new(Inner { matches: HashMap::new(), codes: HashMap::new(), next_conn: 1 }),
+            inner: Mutex::new(Inner {
+                matches: HashMap::new(),
+                codes: HashMap::new(),
+                next_conn: 1,
+                queues: Vec::new(),
+                next_order: 1,
+                ratings: HashMap::new(),
+                queue_joins: HashMap::new(),
+            }),
             now: Box::new(system_now),
+            seeds: HashMap::new(),
+            window: RANKED_WINDOW,
         }
     }
 
@@ -222,6 +450,34 @@ impl Host {
     pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
         self.now = Box::new(now);
         self
+    }
+
+    /// Start `user_id` (the id in `dev:<id>:<name>`) at `rating` in every
+    /// game and mode until it has played a rated match (`--rating`).
+    pub fn seed_rating(mut self, user_id: &str, rating: f64) -> Self {
+        self.seeds.insert(user_id.to_string(), rating);
+        self
+    }
+
+    /// How fast ranked windows widen (tests and local experiments; the
+    /// production rule is [`RANKED_WINDOW`]).
+    pub fn with_ranked_window(mut self, rule: WindowRule) -> Self {
+        self.window = rule;
+        self
+    }
+
+    /// The rating of a player in a game and mode: what it has played to,
+    /// or its seed, or a new player's 1500.
+    pub fn rating(&self, app: &str, user_id: &str, mode: &str) -> RatingRow {
+        let inner = self.lock();
+        self.rating_in(&inner.ratings, app, user_id, mode)
+    }
+
+    fn rating_in(&self, ratings: &HashMap<(String, String, String), RatingRow>, app: &str, user_id: &str, mode: &str) -> RatingRow {
+        ratings
+            .get(&(app.to_string(), user_id.to_string(), mode.to_string()))
+            .copied()
+            .unwrap_or_else(|| RatingRow::fresh(self.seeds.get(user_id).copied().unwrap_or(pairing::DEFAULT_RATING)))
     }
 
     /// Register a validated rules module under an app id. The version comes
@@ -283,19 +539,11 @@ impl Host {
                 _ => return err_msg(400, "bad-config", "config is not base64 or too large"),
             },
         };
-        let clock = match body.get("clock") {
-            None | Some(Value::Null) => None,
-            Some(c) => {
-                let initial = c.get("initial_ms").and_then(Value::as_i64);
-                let increment = c.get("increment_ms").and_then(Value::as_i64);
-                match (initial, increment) {
-                    (Some(i), Some(inc)) if (1000..=7 * 24 * 3_600_000).contains(&i) && (0..=24 * 3_600_000).contains(&inc) => {
-                        Some(Clock { initial_ms: i, increment_ms: inc })
-                    }
-                    _ => return err(400, "bad-clock"),
-                }
-            }
-        };
+        let Ok(clock) = parse_clock(body.get("clock")) else { return err(400, "bad-clock") };
+        let listed = body.get("listed").and_then(Value::as_bool) == Some(true);
+        if listed && config.len() > MAX_LISTED_CONFIG_BYTES {
+            return err_msg(400, "bad-config", format!("a listed match's config is at most {MAX_LISTED_CONFIG_BYTES} bytes"));
+        }
 
         // Dry run: a bad config fails now, not when the second player joins.
         let meta = rules.meta().clone();
@@ -309,35 +557,10 @@ impl Host {
         }
 
         let now = (self.now)();
-        let match_id = uuid::Uuid::new_v4().to_string();
         let token = random_token();
-        let mut m = Match {
-            match_id: match_id.clone(),
-            app_id: app.to_string(),
-            rules_version: version.clone(),
-            rules,
-            config,
-            status: Status::Waiting,
-            created_at: now,
-            clock,
-            seats: vec![SeatRow {
-                seat: 0,
-                user_id: user.user_id.clone(),
-                username: user.username.clone(),
-                token: token.clone(),
-                remaining_ms: clock.map(|c| c.initial_ms),
-                last_client_seq: 0,
-            }],
-            state: None,
-            seq: 0,
-            to_move: Vec::new(),
-            since: HashMap::new(),
-            outcome: None,
-            conns: Vec::new(),
-            clock_failures: 0,
-            clock_retry_at: 0,
-            log: Vec::new(),
-        };
+        let mut m = new_match(app, &version, rules, config, clock, "casual", listed, now);
+        let match_id = m.match_id.clone();
+        m.seats.push(seat_row(0, user, &token, clock));
         if m.seats.len() >= meta.max_seats as usize {
             if let Err(reply) = m.start(now) {
                 return reply;
@@ -352,12 +575,73 @@ impl Host {
             }
         };
         let status = m.status;
+        // One listing per host: its previous open match leaves the list
+        // (it can still be joined by code or id).
+        if m.shown {
+            for other in inner.matches.values_mut() {
+                if other.app_id == app && other.shown && other.seats.first().map(|s| s.user_id.as_str()) == Some(user.user_id.as_str()) {
+                    other.shown = false;
+                }
+            }
+        }
+        let shown = m.shown;
         inner.codes.insert((app.to_string(), code.clone()), key(app, &match_id));
         inner.matches.insert(key(app, &match_id), m);
         (200, json!({
             "match_id": match_id, "app_id": app, "rules_version": version,
-            "seat": 0, "seat_token": token, "status": status.as_str(), "join_code": code,
+            "seat": 0, "seat_token": token, "status": status.as_str(), "join_code": code, "listed": shown,
         }))
+    }
+
+    /// `GET /v1/:app/open?rules_version=` — listed matches waiting for a
+    /// player, newest first, at most [`MAX_OPEN_RESULTS`]. Public.
+    pub fn open_matches(&self, app: &str, rules_version: &str) -> Reply {
+        if !self.has_app(app) {
+            return err_msg(404, "unknown-app", format!("no rules loaded for {app}"));
+        }
+        if rules_version.is_empty() {
+            return err_msg(400, "bad-request", "rules_version is required");
+        }
+        let now = (self.now)();
+        let inner = self.lock();
+        let mut open: Vec<&Match> = inner
+            .matches
+            .values()
+            .filter(|m| {
+                m.app_id == app && m.shown && m.status == Status::Waiting && m.rules_version == rules_version && now < m.created_at + WAITING_TTL_MS
+            })
+            .collect();
+        open.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.match_id.cmp(&b.match_id)));
+        let list: Vec<Value> = open
+            .into_iter()
+            .take(MAX_OPEN_RESULTS)
+            .map(|m| {
+                json!({
+                    "match_id": m.match_id,
+                    "host": m.seats.first().map(|s| s.username.clone()).unwrap_or_default(),
+                    "created_at_ms": m.created_at,
+                    "rules_version": m.rules_version,
+                    "config": B64.encode(&m.config),
+                })
+            })
+            .collect();
+        (200, Value::Array(list))
+    }
+
+    /// `POST /v1/:app/matches/:id/join` — take the open seat of a listed
+    /// match. A private match answers as if it did not exist.
+    pub fn join_open(&self, app: &str, match_id: &str, user: &User) -> Reply {
+        let now = (self.now)();
+        let mut inner = self.lock();
+        let Some(m) = inner.matches.get_mut(&key(app, match_id)) else { return err(404, "no-such-match") };
+        if !m.listed {
+            return err(404, "no-such-match");
+        }
+        let (status, mut body) = m.join(user, false, self.self_play.contains(app), now);
+        if status == 200 {
+            body["join_code"] = Value::Null;
+        }
+        (status, body)
     }
 
     /// `POST /v1/:app/matches/join`
@@ -422,6 +706,7 @@ impl Host {
         if let Some(m) = inner.matches.get_mut(&key(app, match_id)) {
             m.on_frame(conn_id, text, now);
         }
+        self.rate_finished(&mut inner);
     }
 
     /// A socket went away.
@@ -436,14 +721,17 @@ impl Host {
         }
     }
 
-    /// Apply clock expiries and abandon stale lobbies. The HTTP layer calls
-    /// this a few times a second; tests call it directly.
+    /// Apply clock expiries, abandon stale lobbies, rate finished ranked
+    /// matches, and run the queues. The HTTP layer calls this a few times a
+    /// second; tests call it directly.
     pub fn tick(&self) {
         let now = (self.now)();
         let mut inner = self.lock();
         for m in inner.matches.values_mut() {
             m.tick(now);
         }
+        self.rate_finished(&mut inner);
+        self.tick_queues(&mut inner, now);
     }
 
     /// Drop every socket of a match as if the network failed (tests of
@@ -465,7 +753,306 @@ impl Host {
     pub fn log(&self, app: &str, match_id: &str) -> Option<Vec<LogEntry>> {
         self.lock().matches.get(&key(app, match_id)).map(|m| m.log.clone())
     }
+
+    /// The mode a match was made by (tests, debugging).
+    pub fn match_mode(&self, app: &str, match_id: &str) -> Option<String> {
+        self.lock().matches.get(&key(app, match_id)).map(|m| m.mode.clone())
+    }
+
+    // ── matchmaking ─────────────────────────────────────────────────────────
+
+    /// Whether `GET /v1/:app/queue?mode=&rules_version=` may upgrade.
+    pub fn queue_check(&self, app: &str, mode: &str, rules_version: &str) -> Result<(), Reply> {
+        let Some(versions) = self.modules.get(app) else {
+            return Err(err_msg(404, "unknown-app", format!("no rules loaded for {app}")));
+        };
+        if !valid_mode(mode) {
+            return Err(err_msg(400, "bad-mode", "mode: lowercase letters, digits and dashes, at most 32"));
+        }
+        if rules_version.is_empty() {
+            return Err(err_msg(400, "bad-request", "rules_version is required"));
+        }
+        if !versions.contains_key(rules_version) {
+            return Err((404, json!({
+                "error": "unknown-rules",
+                "message": format!("{app} {rules_version} is not loaded"),
+                "available": versions.keys().collect::<Vec<_>>(),
+            })));
+        }
+        Ok(())
+    }
+
+    /// A socket opened on a queue. Returns its id and what to send it.
+    pub fn queue_connect(&self, app: &str, mode: &str, rules_version: &str) -> Result<(u64, UnboundedReceiver<Out>), Reply> {
+        self.queue_check(app, mode, rules_version)?;
+        let now = (self.now)();
+        let mut inner = self.lock();
+        let id = inner.next_conn;
+        inner.next_conn += 1;
+        let (tx, rx) = unbounded_channel();
+        let key = QueueKey { app: app.to_string(), mode: mode.to_string(), rules_version: rules_version.to_string() };
+        inner.queues.push(QueueConn { id, key, tx, open: true, opened_at: now, waiter: None });
+        Ok((id, rx))
+    }
+
+    /// A text frame arrived on a queue socket.
+    pub fn queue_frame(&self, conn_id: u64, text: &str) {
+        let now = (self.now)();
+        let mut inner = self.lock();
+        self.on_queue_frame(&mut inner, conn_id, text, now);
+        self.pair_queues(&mut inner, now);
+        Self::notify_queues(&mut inner, now);
+    }
+
+    /// A queue socket went away: the player leaves the queue.
+    pub fn queue_close(&self, conn_id: u64) {
+        let now = (self.now)();
+        let mut inner = self.lock();
+        inner.queues.retain(|q| q.id != conn_id);
+        Self::notify_queues(&mut inner, now);
+    }
+
+    /// Players waiting in a queue right now (tests).
+    pub fn queue_len(&self, app: &str, mode: &str, rules_version: &str) -> usize {
+        let inner = self.lock();
+        inner
+            .queues
+            .iter()
+            .filter(|q| q.open && q.waiter.is_some() && q.key.app == app && q.key.mode == mode && q.key.rules_version == rules_version)
+            .count()
+    }
+
+    fn on_queue_frame(&self, inner: &mut Inner, conn_id: u64, text: &str, now: i64) {
+        let Some(i) = inner.queues.iter().position(|q| q.id == conn_id && q.open) else { return };
+        let Ok(msg) = serde_json::from_str::<Value>(text) else {
+            inner.queues[i].send(json!({ "t": "error", "code": "bad-json" }));
+            return;
+        };
+        let Some(t) = msg.get("t").and_then(Value::as_str) else {
+            inner.queues[i].send(json!({ "t": "error", "code": "bad-frame" }));
+            return;
+        };
+        if t == "ping" {
+            inner.queues[i].send(json!({ "t": "pong" }));
+            return;
+        }
+        if inner.queues[i].waiter.is_some() {
+            let code = if t == "hello" { "already-queued" } else { "unknown-frame" };
+            inner.queues[i].send(json!({ "t": "error", "code": code, "frame": t }));
+            return;
+        }
+        if t != "hello" {
+            inner.queues[i].close(CLOSE_PROTOCOL, "hello first");
+            return;
+        }
+
+        let key = inner.queues[i].key.clone();
+        // Who, then what; nothing is counted until all of it checks out.
+        let Some(user) = msg.get("ticket").and_then(Value::as_str).and_then(parse_dev_ticket) else {
+            inner.queues[i].refuse("unauthorized", CLOSE_BAD_TOKEN, json!({ "message": "the dev host expects a ticket `dev:<user id>:<username>`" }));
+            return;
+        };
+        let Some(rules) = self.modules.get(&key.app).and_then(|v| v.get(&key.rules_version)).cloned() else {
+            inner.queues[i].refuse("unknown-rules", CLOSE_ENDED, json!({}));
+            return;
+        };
+        let meta = rules.meta().clone();
+        if meta.min_seats > 2 || meta.max_seats < 2 {
+            inner.queues[i].refuse("bad-seats", CLOSE_PROTOCOL, json!({ "message": "the queue makes two-player matches" }));
+            return;
+        }
+        let config = match msg.get("config").and_then(Value::as_str).map(|s| B64.decode(s)) {
+            None => Vec::new(),
+            Some(Ok(bytes)) if bytes.len() <= MAX_CONFIG_BYTES => bytes,
+            Some(_) => {
+                inner.queues[i].refuse("bad-config", CLOSE_PROTOCOL, json!({ "message": "config is not base64 or too large" }));
+                return;
+            }
+        };
+        let Ok(clock) = parse_clock(msg.get("clock")) else {
+            inner.queues[i].refuse("bad-clock", CLOSE_PROTOCOL, json!({}));
+            return;
+        };
+        let probes: Vec<SeatInfo> = (0..2u8).map(|s| SeatInfo { seat: Seat(s), user_id: format!("probe-{s}"), username: format!("probe{s}") }).collect();
+        match rules.init(&config, &probes, &[0u8; 32]) {
+            Ok(Ok(_)) => {}
+            Ok(Err(r)) => {
+                inner.queues[i].refuse(&r.code, CLOSE_PROTOCOL, json!({ "message": r.message }));
+                return;
+            }
+            Err(e) => {
+                inner.queues[i].refuse("rules-error", CLOSE_PROTOCOL, json!({ "message": e.to_string() }));
+                return;
+            }
+        }
+
+        // The join counts against the user's limit for this game.
+        let joins = inner.queue_joins.entry((key.app.clone(), user.user_id.clone())).or_insert((0, now + QUEUE_JOIN_WINDOW_MS));
+        if joins.1 <= now {
+            *joins = (0, now + QUEUE_JOIN_WINDOW_MS);
+        }
+        if joins.0 >= QUEUE_JOIN_LIMIT {
+            let retry = joins.1 - now;
+            inner.queues[i].refuse("rate-limited", CLOSE_RATE, json!({ "retry_after_ms": retry }));
+            return;
+        }
+        joins.0 += 1;
+
+        let rating = pairing::is_ranked(&key.mode).then(|| self.rating_in(&inner.ratings, &key.app, &user.user_id, &key.mode));
+        // One place per user: the newer socket replaces the older.
+        for q in inner.queues.iter_mut() {
+            if q.id != conn_id && q.open && q.key == key && q.waiter.as_ref().map(|w| w.user.user_id.as_str()) == Some(user.user_id.as_str()) {
+                q.send(json!({ "t": "error", "code": "replaced" }));
+                q.close(CLOSE_REPLACED, "replaced by a newer connection");
+            }
+        }
+        let clock_key = clock.map(|c| format!("{}+{}", c.initial_ms, c.increment_ms)).unwrap_or_else(|| "none".into());
+        let pool = format!("{}|{clock_key}", B64.encode(&config));
+        let order = inner.next_order;
+        inner.next_order += 1;
+        let waiting = 1 + inner
+            .queues
+            .iter()
+            .filter(|q| q.open && q.key == key && q.waiter.as_ref().map(|w| w.pool == pool) == Some(true))
+            .count() as u32;
+        let q = &mut inner.queues[i];
+        q.waiter = Some(Waiter { user, config, clock, pool, joined_at: now, order, rating, told: waiting, told_at: now });
+        q.send(json!({ "t": "queued", "waiting": waiting, "rating": rating.map(|r| r.public()) }));
+    }
+
+    /// Pair whoever can be paired, in every queue.
+    fn pair_queues(&self, inner: &mut Inner, now: i64) {
+        let mut keys: Vec<QueueKey> = Vec::new();
+        for q in inner.queues.iter().filter(|q| q.open && q.waiter.is_some()) {
+            if !keys.contains(&q.key) {
+                keys.push(q.key.clone());
+            }
+        }
+        for key in keys {
+            let idx: Vec<usize> = (0..inner.queues.len())
+                .filter(|&i| inner.queues[i].open && inner.queues[i].key == key && inner.queues[i].waiter.is_some())
+                .collect();
+            let candidates: Vec<pairing::Candidate> = idx
+                .iter()
+                .filter_map(|&i| inner.queues[i].waiter.as_ref())
+                .map(|w| pairing::Candidate {
+                    user_id: w.user.user_id.clone(),
+                    pool: w.pool.clone(),
+                    joined_at: w.joined_at,
+                    order: w.order,
+                    rating: w.rating.map(|r| r.rating),
+                })
+                .collect();
+            for (a, b) in pairing::pair(&key.mode, &candidates, now, &self.window) {
+                self.make_match(inner, &key, idx[a], idx[b], now);
+            }
+        }
+    }
+
+    /// A match for a pair, both seats taken, started; each player gets its
+    /// seat token on the queue socket.
+    fn make_match(&self, inner: &mut Inner, qk: &QueueKey, ia: usize, ib: usize, now: i64) {
+        let (Some(wa), Some(wb)) = (inner.queues[ia].waiter.clone(), inner.queues[ib].waiter.clone()) else { return };
+        let order = if coin() { [(ib, wb), (ia, wa)] } else { [(ia, wa), (ib, wb)] };
+        let Some(rules) = self.modules.get(&qk.app).and_then(|v| v.get(&qk.rules_version)).cloned() else {
+            for (i, _) in &order {
+                inner.queues[*i].refuse("match-failed", CLOSE_BACKEND, json!({ "message": "the rules are no longer loaded" }));
+            }
+            return;
+        };
+        let first = &order[0].1;
+        let mut m = new_match(&qk.app, &qk.rules_version, rules, first.config.clone(), first.clock, &qk.mode, false, now);
+        let tokens = [random_token(), random_token()];
+        for (seat, (_, w)) in order.iter().enumerate() {
+            m.seats.push(seat_row(seat as u8, &w.user, &tokens[seat], first.clock));
+        }
+        if let Err((_, body)) = m.start(now) {
+            for (i, _) in &order {
+                inner.queues[*i].refuse("match-failed", CLOSE_BACKEND, json!({ "message": body.to_string() }));
+            }
+            return;
+        }
+        let match_id = m.match_id.clone();
+        inner.matches.insert(key(&qk.app, &match_id), m);
+        for (seat, (i, _)) in order.iter().enumerate() {
+            let q = &mut inner.queues[*i];
+            q.send(json!({
+                "t": "paired", "match_id": match_id, "seat": seat, "seat_token": tokens[seat], "rules_version": qk.rules_version,
+            }));
+            q.close(CLOSE_PAIRED, "paired");
+        }
+    }
+
+    /// Tell each waiting player whose pool size changed, at most once every
+    /// [`NOTIFY_INTERVAL_MS`].
+    fn notify_queues(inner: &mut Inner, now: i64) {
+        let mut counts: HashMap<(QueueKey, String), u32> = HashMap::new();
+        for q in inner.queues.iter().filter(|q| q.open) {
+            if let Some(w) = &q.waiter {
+                *counts.entry((q.key.clone(), w.pool.clone())).or_insert(0) += 1;
+            }
+        }
+        for q in inner.queues.iter_mut().filter(|q| q.open) {
+            let key = q.key.clone();
+            let Some(w) = q.waiter.as_mut() else { continue };
+            let count = counts.get(&(key, w.pool.clone())).copied().unwrap_or(0);
+            if w.told == count || now - w.told_at < NOTIFY_INTERVAL_MS {
+                continue;
+            }
+            w.told = count;
+            w.told_at = now;
+            let frame = json!({ "t": "queued", "waiting": count, "rating": w.rating.map(|r| r.public()) });
+            q.send(frame);
+        }
+    }
+
+    /// Hello deadlines and queue timeouts, then pairing (windows widen).
+    fn tick_queues(&self, inner: &mut Inner, now: i64) {
+        for q in inner.queues.iter_mut().filter(|q| q.open) {
+            match &q.waiter {
+                None if now - q.opened_at >= HELLO_TIMEOUT_MS => q.close(CLOSE_TIMEOUT, "no hello"),
+                Some(w) if now - w.joined_at >= QUEUE_TIMEOUT_MS => q.refuse("queue-timeout", CLOSE_TIMEOUT, json!({})),
+                _ => {}
+            }
+        }
+        self.pair_queues(inner, now);
+        Self::notify_queues(inner, now);
+    }
+
+    /// Ratings for ranked matches that just ended (what record_game_match
+    /// does in production): two seats, two different players, a draw or
+    /// exactly one winner. A forfeit names the other seat the winner.
+    fn rate_finished(&self, inner: &mut Inner) {
+        let Inner { matches, ratings, .. } = inner;
+        for m in matches.values_mut() {
+            if m.status != Status::Over || m.rated {
+                continue;
+            }
+            m.rated = true;
+            if !pairing::is_ranked(&m.mode) || m.seats.len() != 2 || m.seats[0].user_id == m.seats[1].user_id {
+                continue;
+            }
+            let Some(outcome) = &m.outcome else { continue };
+            let won = |s: u8| outcome.winners.contains(&Seat(s));
+            let (s0, s1) = (m.seats[0].seat, m.seats[1].seat);
+            let score = if outcome.draw {
+                0.5
+            } else if won(s0) && !won(s1) {
+                1.0
+            } else if won(s1) && !won(s0) {
+                0.0
+            } else {
+                continue;
+            };
+            let a = self.rating_in(ratings, &m.app_id, &m.seats[0].user_id, &m.mode);
+            let b = self.rating_in(ratings, &m.app_id, &m.seats[1].user_id, &m.mode);
+            let (na, nb) = glicko2::rate_match(a.glicko(), b.glicko(), score);
+            ratings.insert((m.app_id.clone(), m.seats[0].user_id.clone(), m.mode.clone()), a.after(na, score));
+            ratings.insert((m.app_id.clone(), m.seats[1].user_id.clone(), m.mode.clone()), b.after(nb, 1.0 - score));
+        }
+    }
 }
+
 
 impl Default for Host {
     fn default() -> Self {
@@ -572,6 +1159,8 @@ impl Match {
             _ => return Err(err(500, "rules-error")),
         };
         self.status = Status::Active;
+        // A started match leaves the open list.
+        self.shown = false;
         self.since = to_move.iter().map(|s| (*s, now)).collect();
         self.to_move = to_move;
         self.state = Some(state);
@@ -850,6 +1439,7 @@ impl Match {
     fn tick(&mut self, now: i64) {
         if self.status == Status::Waiting && now >= self.created_at + WAITING_TTL_MS {
             self.status = Status::Abandoned;
+            self.shown = false;
             let ids: Vec<u64> = self.conns.iter().map(|c| c.id).collect();
             for id in ids {
                 self.send(id, json!({ "t": "error", "code": "abandoned" }));
