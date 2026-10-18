@@ -177,6 +177,7 @@ fn views_are_typed_and_per_seat() {
     assert_eq!((va.you, vb.you), (Some(0), Some(1)));
     assert_eq!(wa.to_move, vec![0]);
     assert_eq!(wa.seats.iter().map(|s| s.username.as_str()).collect::<Vec<_>>(), vec!["mandy", "rex"]);
+    assert_eq!(wa.seats.iter().map(|s| s.user_id.as_deref()).collect::<Vec<_>>(), vec![Some("user-a"), Some("user-b")]);
 }
 
 #[test]
@@ -670,6 +671,7 @@ fn open_matches_are_listed_and_joined_by_id() {
     let open = listing(list_open(&ep));
     assert_eq!(open.len(), 1);
     assert_eq!((open[0].match_id.as_str(), open[0].host.as_str(), open[0].rules_version.as_str()), (info.match_id.as_str(), "mandy", "1.0.0"));
+    assert_eq!(open[0].host_user_id.as_deref(), Some("user-a"));
     assert!(open[0].config.is_empty() && open[0].created_at_ms > 0);
     assert!(listing(list_open(&endpoint(&s, "tictactoe", "9.9.9"))).is_empty());
 

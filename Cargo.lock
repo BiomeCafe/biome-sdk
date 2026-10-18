@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "biome-match-dev"
-version = "0.1.3"
+version = "0.1.24"
 dependencies = [
  "axum",
  "base64",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "biome-online-services"
-version = "0.1.3"
+version = "0.1.24"
 dependencies = [
  "base64",
  "bevy_app",
@@ -341,12 +341,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.59.0",
  "winreg",
 ]
 
 [[package]]
 name = "biome-publish"
-version = "0.1.3"
+version = "0.1.24"
 dependencies = [
  "axum",
  "base64",
@@ -365,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "biome-rules"
-version = "0.1.3"
+version = "0.1.24"
 dependencies = [
  "postcard",
  "rand_chacha 0.3.1",
@@ -376,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "biome-rules-host"
-version = "0.1.3"
+version = "0.1.24"
 dependencies = [
  "biome-rules",
  "rules-highcard",
@@ -1653,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "rules-highcard"
-version = "0.1.3"
+version = "0.1.24"
 dependencies = [
  "biome-rules",
  "serde",
@@ -1661,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "rules-tictactoe"
-version = "0.1.3"
+version = "0.1.24"
 dependencies = [
  "biome-rules",
  "serde",

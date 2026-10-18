@@ -18,9 +18,10 @@
 //!    valid nonce — they get `HandshakeRejected` and have to be re-launched
 //!    (or fall back to attach).
 //! 2. **Attach** (2026-10) — the game started on its own and sends an
-//!    `AttachHello`. The server checks there is a session, tells the client
-//!    `AwaitingConsent`, asks the backend (which asks the user, remembering
-//!    the answer per app), then answers `Ok` or `Rejected`.
+//!    `AttachHello`. The server checks there is a session, asks the backend
+//!    (which may let the game in silently, or ask the user and remember the
+//!    answer per app), tells the client `AwaitingConsent` only when the
+//!    backend is about to ask (or is slow), then answers `Ok` or `Rejected`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use crate::protocol::{
     reject, AttachHello, BosMsgV1, BosWire, RequestBody, ResponseBody, ServerHello,
     CURRENT_SDK_VERSION,
 };
+use crate::peer::PeerProcess;
 use crate::transport::{self, platform};
 use crate::types::{AttachVia, GameTicket, Session};
 
@@ -47,9 +49,41 @@ use crate::types::{AttachVia, GameTicket, Session};
 pub struct AttachRequest {
     pub app_id: String,
     pub app_name: String,
+    /// What the game says its process id is. Untrusted, like the rest.
     pub game_pid: u32,
     pub client_version: String,
+    /// The process id the operating system reports for the other end of
+    /// this connection ([`crate::peer`]). Unlike `game_pid` the client can't
+    /// choose it. `None` where the platform can't tell.
+    pub peer_pid: Option<u32>,
+    /// That process, pinned when the connection was accepted: ask it which
+    /// program is attaching ([`PeerProcess::exe`]), never a pid looked up
+    /// again later (it could belong to another process by then).
+    pub peer: Option<PeerProcess>,
+    /// Call [`PromptNotice::about_to_prompt`] right before showing the
+    /// player anything (or waiting on a prompt for another game): the server
+    /// then tells the client `AwaitingConsent`, so it waits on a human
+    /// timescale. A silent decision never calls it, and the client never
+    /// sees "waiting for consent".
+    pub prompting: PromptNotice,
 }
+
+/// How a backend tells the server it is about to ask the player
+/// ([`AttachRequest::prompting`]).
+#[derive(Clone, Debug, Default)]
+pub struct PromptNotice(Arc<tokio::sync::Notify>);
+
+impl PromptNotice {
+    pub fn about_to_prompt(&self) {
+        self.0.notify_one();
+    }
+}
+
+/// A decision that takes longer than this without a prompt (a slow registry
+/// lookup) gets `AwaitingConsent` anyway, so it lands inside the client's
+/// first-reply deadline (`ConnectOptions::handshake_timeout`, 2 s by
+/// default) and the client waits for the answer instead of timing out.
+pub const AWAITING_CONSENT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The backend's answer to an attach request.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,8 +269,10 @@ impl BosServer {
                         accept = listener.accept() => {
                             match accept {
                                 Ok((stream, _addr)) => {
+                                    let peer = crate::peer::unix_peer_pid(&stream).map(PeerProcess::open);
                                     spawn_conn(
                                         stream,
+                                        peer,
                                         backend_clone.clone(),
                                         push_tx_clone.subscribe(),
                                         issued_clone.clone(),
@@ -284,8 +320,12 @@ impl BosServer {
                                 tracing::error!("named pipe connect: {e}");
                                 continue;
                             }
+                            // Pin the client process now, while it is
+                            // certainly the one on the pipe (PeerProcess).
+                            let peer = crate::peer::pipe_client_pid(&current).map(PeerProcess::open);
                             spawn_conn(
                                 current,
+                                peer,
                                 backend_clone.clone(),
                                 push_tx_clone.subscribe(),
                                 issued_clone.clone(),
@@ -335,6 +375,7 @@ impl BosServer {
 
 fn spawn_conn<S, B>(
     stream: S,
+    peer: Option<PeerProcess>,
     backend: Arc<B>,
     push_rx: tokio::sync::broadcast::Receiver<BiomeEvent>,
     issued: NonceBook,
@@ -345,7 +386,7 @@ fn spawn_conn<S, B>(
     B: BosBackend,
 {
     tokio::spawn(async move {
-        if let Err(e) = handle_conn(stream, backend, push_rx, issued, dev_mode, verbose).await {
+        if let Err(e) = handle_conn(stream, peer, backend, push_rx, issued, dev_mode, verbose).await {
             tracing::warn!("BOS connection ended: {e}");
         }
     });
@@ -366,6 +407,7 @@ where
 
 async fn handle_conn<S, B>(
     stream: S,
+    peer: Option<PeerProcess>,
     backend: Arc<B>,
     mut push_rx: tokio::sync::broadcast::Receiver<BiomeEvent>,
     issued: NonceBook,
@@ -418,7 +460,7 @@ where
             if verbose {
                 tracing::info!(?hello, "received AttachHello");
             }
-            attach(&mut framed, backend.as_ref(), hello, dev_mode).await?
+            attach(&mut framed, backend.as_ref(), hello, peer, dev_mode).await?
         }
         None => {
             // Opened and closed without a hello: that's `detect::detect()`
@@ -498,6 +540,7 @@ async fn attach<S, B>(
     framed: &mut transport::Framed<S>,
     backend: &B,
     hello: AttachHello,
+    peer: Option<PeerProcess>,
     dev_mode: bool,
 ) -> Result<ConnContext, BosError>
 where
@@ -522,23 +565,43 @@ where
         return Err(BosError::HandshakeRejected(reject::NOT_SIGNED_IN.into()));
     }
 
-    // Tell the client to wait on a human timescale, then ask.
-    transport::send_wire(
-        framed,
-        &BosWire::V1(BosMsgV1::ServerHello(ServerHello::AwaitingConsent {
-            app_id: hello.app_id.clone(),
-        })),
-    )
-    .await?;
-
-    let decision = backend
-        .authorize_attach(AttachRequest {
-            app_id: hello.app_id,
-            app_name: hello.app_name,
-            game_pid: hello.game_pid,
-            client_version: hello.client_version,
-        })
-        .await;
+    // Ask the backend. `AwaitingConsent` goes out only when it is about to
+    // prompt (or the answer is slow, AWAITING_CONSENT_AFTER), so a game let
+    // in silently never shows "waiting for consent".
+    let awaiting = BosWire::V1(BosMsgV1::ServerHello(ServerHello::AwaitingConsent {
+        app_id: hello.app_id.clone(),
+    }));
+    let prompting = PromptNotice::default();
+    let decide = backend.authorize_attach(AttachRequest {
+        app_id: hello.app_id,
+        app_name: hello.app_name,
+        game_pid: hello.game_pid,
+        client_version: hello.client_version,
+        peer_pid: peer.as_ref().map(PeerProcess::pid),
+        peer,
+        prompting: prompting.clone(),
+    });
+    tokio::pin!(decide);
+    let slow = tokio::time::sleep(AWAITING_CONSENT_AFTER);
+    tokio::pin!(slow);
+    // A failed send doesn't end the wait: the prompt may already be up, and
+    // the player's answer is still kept; the final reply then fails instead.
+    let mut told = false;
+    let decision = loop {
+        tokio::select! {
+            // An answer that is ready wins over a prompt notice sent with it.
+            biased;
+            decision = &mut decide => break decision,
+            _ = prompting.0.notified(), if !told => {
+                let _ = transport::send_wire(framed, &awaiting).await;
+                told = true;
+            }
+            _ = &mut slow, if !told => {
+                let _ = transport::send_wire(framed, &awaiting).await;
+                told = true;
+            }
+        }
+    };
 
     match decision {
         AttachDecision::Allowed => {
@@ -590,6 +653,11 @@ mod tests {
         session: Option<Session>,
         decision: AttachDecision,
         launch: AttachDecision,
+        /// Whether reaching `decision` takes a prompt (false: a silent
+        /// decision, like Biome's own install).
+        prompts: bool,
+        /// How long the decision takes.
+        think: Duration,
     }
 
     impl FakeBackend {
@@ -602,10 +670,12 @@ mod tests {
                 }),
                 decision,
                 launch: AttachDecision::Allowed,
+                prompts: true,
+                think: Duration::ZERO,
             }
         }
         fn signed_out() -> Self {
-            Self { session: None, decision: AttachDecision::Allowed, launch: AttachDecision::Allowed }
+            Self { session: None, decision: AttachDecision::Allowed, launch: AttachDecision::Allowed, prompts: true, think: Duration::ZERO }
         }
     }
 
@@ -618,6 +688,13 @@ mod tests {
         }
         async fn authorize_attach(&self, req: AttachRequest) -> AttachDecision {
             assert_eq!(req.app_id, "test-app");
+            // The pid the connection came with, not the one the game claimed.
+            assert_eq!((req.peer_pid, req.game_pid), (Some(4242), 1));
+            assert_eq!(req.peer.as_ref().map(PeerProcess::pid), Some(4242));
+            if self.prompts {
+                req.prompting.about_to_prompt();
+            }
+            tokio::time::sleep(self.think).await;
             self.decision.clone()
         }
         async fn authorize_launch(&self, _app_id: String) -> AttachDecision {
@@ -674,7 +751,7 @@ mod tests {
         let (push_tx, push_rx) = tokio::sync::broadcast::channel(8);
         let server = tokio::spawn(async move {
             let _keep_push_open = push_tx;
-            handle_conn(server_io, Arc::new(backend), push_rx, issued, dev_mode, false).await
+            handle_conn(server_io, Some(PeerProcess::unpinned(4242)), Arc::new(backend), push_rx, issued, dev_mode, false).await
         });
         let mut client = transport::frame(client_io);
         transport::send_wire(&mut client, &first).await.unwrap();
@@ -793,7 +870,7 @@ mod tests {
         let issued = Arc::new(Mutex::new(HashMap::new()));
         let server = tokio::spawn(async move {
             let _keep = push_tx;
-            handle_conn(server_io, Arc::new(FakeBackend::signed_out()), push_rx, issued, false, false).await
+            handle_conn(server_io, None, Arc::new(FakeBackend::signed_out()), push_rx, issued, false, false).await
         });
         drop(client_io); // what detect() does: open, then close
         assert!(matches!(server.await.unwrap(), Ok(())));
@@ -912,14 +989,42 @@ mod tests {
         let issued = Arc::new(Mutex::new(HashMap::new()));
         let _server = tokio::spawn(async move {
             let _keep = push_tx;
-            handle_conn(server_io, Arc::new(Bare), push_rx, issued, false, false).await
+            handle_conn(server_io, None, Arc::new(Bare), push_rx, issued, false, false).await
         });
         let mut client = transport::frame(client_io);
         transport::send_wire(&mut client, &attach_hello()).await.unwrap();
+        // It refuses without asking anyone, so no "waiting for consent".
         let first = transport::recv_wire(&mut client).await.unwrap();
-        assert!(is_awaiting(&first));
-        let second = transport::recv_wire(&mut client).await.unwrap();
-        assert_eq!(rejected_reason(&second).as_deref(), Some(reject::ATTACH_UNSUPPORTED));
+        assert_eq!(rejected_reason(&first).as_deref(), Some(reject::ATTACH_UNSUPPORTED));
+    }
+
+    #[tokio::test]
+    async fn a_silent_allow_never_says_awaiting_consent() {
+        // Biome's own install: let in without a prompt, so the first and
+        // only answer is Ok.
+        let mut backend = FakeBackend::signed_in(AttachDecision::Allowed);
+        backend.prompts = false;
+        let (first, _c, _s) = connect_with(backend, Arc::new(Mutex::new(HashMap::new())), false, attach_hello()).await;
+        assert!(is_ok_hello(&first), "{first:?}");
+        // A silent refusal (a remembered deny) likewise.
+        let mut backend = FakeBackend::signed_in(AttachDecision::Rejected(reject::CONSENT_DENIED.into()));
+        backend.prompts = false;
+        let (first, _c, _s) = connect_with(backend, Arc::new(Mutex::new(HashMap::new())), false, attach_hello()).await;
+        assert_eq!(rejected_reason(&first).as_deref(), Some(reject::CONSENT_DENIED));
+    }
+
+    #[tokio::test]
+    async fn a_slow_silent_decision_says_awaiting_consent_in_time() {
+        // A registry lookup that takes longer than the client's first-reply
+        // deadline would allow: AwaitingConsent goes out before it.
+        let mut backend = FakeBackend::signed_in(AttachDecision::Allowed);
+        backend.prompts = false;
+        backend.think = AWAITING_CONSENT_AFTER + Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let (first, mut client, _s) = connect_with(backend, Arc::new(Mutex::new(HashMap::new())), false, attach_hello()).await;
+        assert!(is_awaiting(&first), "{first:?}");
+        assert!(started.elapsed() < AWAITING_CONSENT_AFTER + Duration::from_millis(250));
+        assert!(is_ok_hello(&transport::recv_wire(&mut client).await.unwrap()));
     }
 
     #[tokio::test]

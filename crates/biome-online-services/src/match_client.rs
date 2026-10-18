@@ -178,6 +178,8 @@ pub struct OpenMatch {
     pub match_id: String,
     /// The username of the player who opened it.
     pub host: String,
+    /// Stable public account ID; absent on hosts deployed before cards.
+    pub host_user_id: Option<String>,
     /// When it was opened, milliseconds since the Unix epoch.
     pub created_at_ms: u64,
     pub rules_version: String,
@@ -201,6 +203,8 @@ pub struct SeatedInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SeatStatus {
     pub seat: u8,
+    /// Stable public account ID; absent on older welcome/seats frames.
+    pub user_id: Option<String>,
     pub username: String,
     pub connected: bool,
 }
@@ -745,6 +749,7 @@ fn parse_open_match(v: &Value) -> Option<OpenMatch> {
     Some(OpenMatch {
         match_id: v.get("match_id")?.as_str()?.to_string(),
         host: v.get("host").and_then(Value::as_str).unwrap_or_default().to_string(),
+        host_user_id: v.get("host_user_id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string),
         created_at_ms: v.get("created_at_ms").and_then(Value::as_u64).unwrap_or(0),
         rules_version: v.get("rules_version").and_then(Value::as_str).unwrap_or_default().to_string(),
         config: v.get("config").and_then(Value::as_str).and_then(|s| B64.decode(s).ok()).unwrap_or_default(),
@@ -928,6 +933,7 @@ fn parse_seats(v: Option<&Value>) -> Vec<SeatStatus> {
             a.iter()
                 .map(|s| SeatStatus {
                     seat: s.get("seat").and_then(Value::as_u64).unwrap_or(0) as u8,
+                    user_id: s.get("user_id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string),
                     username: str_of(s, "username"),
                     connected: s.get("connected").and_then(Value::as_bool).unwrap_or(false),
                 })
@@ -993,7 +999,7 @@ mod tests {
         assert_eq!(parse_rating(Some(&Value::Null)), None);
         assert_eq!(parse_rating(Some(&json!({ "rating": "high" }))), None);
         let m = parse_open_match(&json!({ "match_id": "m1", "host": "mandy", "created_at_ms": 5, "rules_version": "1.0.0", "config": B64.encode([3u8, 5]) }));
-        assert_eq!(m, Some(OpenMatch { match_id: "m1".into(), host: "mandy".into(), created_at_ms: 5, rules_version: "1.0.0".into(), config: vec![3, 5] }));
+        assert_eq!(m, Some(OpenMatch { match_id: "m1".into(), host: "mandy".into(), host_user_id: None, created_at_ms: 5, rules_version: "1.0.0".into(), config: vec![3, 5] }));
         assert_eq!(parse_open_match(&json!({ "host": "no id" })), None);
     }
 
@@ -1008,7 +1014,7 @@ mod tests {
         assert_eq!(w.seat, 1);
         assert_eq!(w.view, Some(vec![1, 2, 3]));
         assert_eq!(w.clock.unwrap().get(&0), Some(&5000));
-        assert_eq!(w.seats[1], SeatStatus { seat: 1, username: "b".into(), connected: false });
+        assert_eq!(w.seats[1], SeatStatus { seat: 1, user_id: None, username: "b".into(), connected: false });
 
         let u = parse_update(&json!({ "t": "update", "seq": 4, "by": 0, "kind": "move", "events": [B64.encode([9u8])], "view": null, "to_move": [], "clock": null }));
         assert_eq!((u.seq, u.by, u.events, u.view, u.clock), (4, 0, vec![vec![9u8]], None, None));

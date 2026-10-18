@@ -38,7 +38,8 @@ pub const ENDPOINT_ENV: &str = "BIOME_PUBLISH_ENDPOINT";
 /// Budget for one API call (not for uploads, which take as long as they take).
 const API_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Attempts per upload when the network or storage (5xx) fails.
+/// Attempts per upload when the network or storage (5xx) fails. A
+/// connection lost on the first try also gets one quiet re-send on top.
 const UPLOAD_ATTEMPTS: u32 = 3;
 
 // ---------------------------------------------------------------- wire types
@@ -232,7 +233,7 @@ pub struct SubmitResponse {
     /// setup.exe"). Empty otherwise.
     #[serde(default)]
     pub reasons: Vec<String>,
-    /// The virus scan: "pending" right after submit.
+    /// BioShield's check: "pending" right after submit.
     #[serde(default)]
     pub scan: Option<String>,
     /// What happens when the scan is clean: "live" (a file listing whose
@@ -260,11 +261,11 @@ pub struct ReleaseSummary {
     pub submitted_at: Option<String>,
     #[serde(default)]
     pub reviewed_at: Option<String>,
-    /// The virus scan of its files: pending, clean, infected, incomplete,
+    /// BioShield's check of its files: pending, clean, infected, incomplete,
     /// error, overridden or skipped.
     #[serde(default)]
     pub scan: Option<String>,
-    /// The scan in a line: "scanning for viruses", "virus found: a.zip: …".
+    /// The check in a line: "BioShield: checking", "BioShield flagged a.zip".
     #[serde(default)]
     pub scan_note: Option<String>,
 }
@@ -319,6 +320,8 @@ pub fn check_token(raw: Option<&str>) -> Result<String, Error> {
 
 pub struct Api {
     http: Client,
+    /// For presigned uploads: a new connection each (see [`Api::new`]).
+    storage: Client,
     endpoint: String,
     token: String,
     progress: bool,
@@ -332,14 +335,25 @@ impl fmt::Debug for Api {
 
 impl Api {
     /// `progress`: print upload percentages to stderr.
+    ///
+    /// Uploads keep no idle connections. The client zip, sent on the
+    /// keep-alive connection R2 had just answered the rules PUT on, would
+    /// now and then find it closed under it and fail (reqwest's blocking
+    /// client reports that as "send failed because receiver is gone").
+    /// hyper re-sends a request on a new connection only if none of it went
+    /// out, never a streamed body. The price is a TLS handshake per upload;
+    /// per-file objects go 8 at a time, which hides most of it.
     pub fn new(endpoint: String, token: String, progress: bool) -> Result<Api, Error> {
-        let http = Client::builder()
-            .user_agent(concat!("biome-publish/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(None::<Duration>)
-            .build()
-            .map_err(|e| Error::io(format!("cannot start the HTTP client: {}", chain(&e))))?;
-        Ok(Api { http, endpoint, token, progress })
+        let client = |idle_per_host: usize| {
+            Client::builder()
+                .user_agent(concat!("biome-publish/", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(30))
+                .timeout(None::<Duration>)
+                .pool_max_idle_per_host(idle_per_host)
+                .build()
+                .map_err(|e| Error::io(format!("cannot start the HTTP client: {}", chain(&e))))
+        };
+        Ok(Api { http: client(usize::MAX)?, storage: client(0)?, endpoint, token, progress })
     }
 
     pub fn endpoint(&self) -> &str {
@@ -396,7 +410,9 @@ impl Api {
 
     /// Stream `path` (exactly `size` bytes) to a presigned URL with exactly
     /// the headers the server returned. No `Authorization` header: the URL
-    /// carries its own signature. Retries network failures and 5xx.
+    /// carries its own signature. Retries network failures and 5xx. A first
+    /// try that reached storage and lost the connection is sent again at
+    /// once, without a word; only a failure after that is logged.
     pub fn upload(&self, upload: &Upload, path: &Path, size: u64, label: &str, log: &mut dyn Write) -> Result<(), Error> {
         let method = Method::from_bytes(upload.method.as_bytes())
             .map_err(|_| Error::bad_response(format!("upload method {:?} is not an HTTP method", upload.method)))?;
@@ -410,14 +426,19 @@ impl Api {
         let shown = redact(&url);
 
         let mut attempt = 1;
+        let mut quiet = true;
         loop {
             let file = File::open(path).map_err(|e| Error::io(format!("cannot read {}: {e}", path.display())))?;
             let reader = Progress::new(file, size, label, self.progress);
-            let result = self.http.request(method.clone(), url.clone()).headers(headers.clone()).body(Body::sized(reader, size)).send();
+            let result = self.storage.request(method.clone(), url.clone()).headers(headers.clone()).body(Body::sized(reader, size)).send();
             let retry_reason = match result {
                 Ok(resp) if resp.status().is_success() => return Ok(()),
                 Ok(resp) if resp.status().is_server_error() => format!("storage answered HTTP {}", resp.status().as_u16()),
                 Ok(resp) => return Err(storage_refusal(resp, label, &shown)),
+                Err(e) if attempt == 1 && quiet && !e.is_connect() => {
+                    quiet = false;
+                    continue;
+                }
                 Err(e) => format!("network error: {}", chain(&e.without_url())),
             };
             if attempt >= UPLOAD_ATTEMPTS {
@@ -467,6 +488,13 @@ pub fn refusal(status: u16, body: &str) -> Refusal {
                 (_, Some(name), _, _) => details.push(format!("missing upload: {kind} {platform} {name}")),
                 _ => details.push(format!("missing upload: {kind} {platform}")),
             }
+        }
+    }
+    // A rules module that clashes with the approved one (rules-conflict).
+    if let Some(theirs) = text("approved_sha256") {
+        details.push(format!("approved module sha256: {theirs}"));
+        if let Some(mine) = text("sha256") {
+            details.push(format!("this module sha256:     {mine}"));
         }
     }
     // A file listing's files that are not plain files (not-plain-file).
@@ -554,6 +582,8 @@ impl<R: Read> Read for Progress<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     #[test]
@@ -591,6 +621,17 @@ mod tests {
         assert_eq!(r.details, ["existing release status: submitted"]);
         let r = refusal(409, r#"{"error":"upload-incomplete","missing":[{"kind":"client","platform":"windows-x64"},{"kind":"rules"}]}"#);
         assert_eq!(r.details, ["missing upload: client windows-x64", "missing upload: rules any"]);
+        let r = refusal(
+            409,
+            &format!(
+                r#"{{"error":"rules-conflict","message":"rules 1.0.0 is already approved with a different module (sha256 aaaaaaaaaaaa…); ship that exact module, or bump rules_version if the rules changed","rules_version":"1.0.0","sha256":"{}","approved_sha256":"{}"}}"#,
+                "b".repeat(64),
+                "a".repeat(64)
+            ),
+        );
+        assert_eq!(r.error, "rules-conflict");
+        assert!(r.message.as_deref().unwrap().starts_with("rules 1.0.0 is already approved with a different module"));
+        assert_eq!(r.details, [format!("approved module sha256: {}", "a".repeat(64)), format!("this module sha256:     {}", "b".repeat(64))]);
         let r = refusal(400, r#"{"error":"bad-request","message":"clients: platforms must be unique"}"#);
         assert_eq!(r.message.as_deref(), Some("clients: platforms must be unique"));
         let r = refusal(502, "<html>Bad Gateway</html>");
@@ -670,6 +711,123 @@ mod tests {
             r#"{"error":"upload-incomplete","missing":[{"kind":"object","platform":"any","sha256":"0123456789abcdef0123","path":"data/a.pak"}]}"#,
         );
         assert_eq!(r.details, ["missing upload: object data/a.pak (0123456789ab)"]);
+    }
+
+    /// Storage that speaks just enough HTTP/1.1. It reads each PUT and
+    /// answers 200, keeping the connection alive, as R2 does. `cut(n)`: cut
+    /// connection `n` off partway through the body instead. `linger`: close
+    /// each connection that long after its first answer, without a
+    /// `Connection: close` (what the client zip ran into on R2).
+    struct Storage {
+        url: String,
+        seen: Arc<Mutex<Seen>>,
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        connections: usize,
+        /// The bodies of the PUTs answered.
+        bodies: Vec<usize>,
+        /// Requests sent on a connection storage was about to close.
+        stale: usize,
+    }
+
+    fn storage(cut: fn(usize) -> bool, linger: Option<Duration>) -> Storage {
+        use std::net::{TcpListener, TcpStream};
+        fn head(conn: &mut TcpStream) -> Option<usize> {
+            let mut bytes = Vec::new();
+            let mut byte = [0u8];
+            while !bytes.ends_with(b"\r\n\r\n") {
+                conn.read_exact(&mut byte).ok()?;
+                bytes.push(byte[0]);
+            }
+            let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+            text.lines().find_map(|l| l.strip_prefix("content-length:")).and_then(|v| v.trim().parse().ok())
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/bucket/key?X-Amz-Signature=s", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let shared = seen.clone();
+        std::thread::spawn(move || {
+            for (n, conn) in listener.incoming().enumerate() {
+                let Ok(mut conn) = conn else { return };
+                shared.lock().unwrap().connections += 1;
+                let seen = shared.clone();
+                std::thread::spawn(move || loop {
+                    let Some(len) = head(&mut conn) else { return };
+                    let mut body = vec![0u8; if cut(n) { len.min(64 * 1024) } else { len }];
+                    if conn.read_exact(&mut body).is_err() || cut(n) {
+                        // Dropped with the rest unread: the client gets a reset.
+                        return;
+                    }
+                    seen.lock().unwrap().bodies.push(body.len());
+                    let _ = conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+                    if let Some(linger) = linger {
+                        std::thread::sleep(linger);
+                        let _ = conn.set_nonblocking(true);
+                        if conn.peek(&mut [0u8]).is_ok_and(|n| n > 0) {
+                            seen.lock().unwrap().stale += 1;
+                        }
+                        return;
+                    }
+                });
+            }
+        });
+        Storage { url, seen }
+    }
+
+    fn put_to(url: &str) -> Upload {
+        serde_json::from_value(serde_json::json!({"kind": "client", "platform": "windows-x64", "url": url})).unwrap()
+    }
+
+    fn test_api() -> Api {
+        Api::new("http://127.0.0.1:9/fn".into(), "bpt_test".into(), false).unwrap()
+    }
+
+    /// The rules module, then the big client zip, as `upload` sends them:
+    /// the client must not go out on the connection the rules used, which
+    /// storage may be closing.
+    #[test]
+    fn each_upload_has_a_connection_of_its_own() {
+        let store = storage(|_| false, Some(Duration::from_millis(50)));
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api();
+        let mut log = Vec::new();
+        for (name, size) in [("rules", 325_007), ("client", 4 << 20)] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, vec![7u8; size]).unwrap();
+            api.upload(&put_to(&store.url), &path, size as u64, name, &mut log).unwrap();
+        }
+        assert_eq!(String::from_utf8(log).unwrap(), "", "no retries");
+        let seen = store.seen.lock().unwrap();
+        assert_eq!((seen.connections, seen.stale), (2, 0));
+        assert_eq!(seen.bodies, [325_007, 4 << 20]);
+    }
+
+    /// A connection lost under the first try is sent again quietly. When it
+    /// happens again, the log says so.
+    #[test]
+    fn a_lost_connection_is_sent_again_quietly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.zip");
+        std::fs::write(&path, vec![7u8; 4 << 20]).unwrap();
+        let api = test_api();
+
+        let store = storage(|n| n == 0, None);
+        let mut log = Vec::new();
+        api.upload(&put_to(&store.url), &path, 4 << 20, "client", &mut log).unwrap();
+        assert_eq!(String::from_utf8(log).unwrap(), "");
+        let seen = store.seen.lock().unwrap();
+        assert_eq!((seen.connections, seen.bodies.as_slice()), (2, [4 << 20].as_slice()));
+        drop(seen);
+
+        let store = storage(|n| n < 2, None);
+        let mut log = Vec::new();
+        api.upload(&put_to(&store.url), &path, 4 << 20, "client", &mut log).unwrap();
+        let log = String::from_utf8(log).unwrap();
+        assert!(log.starts_with("  client: network error: ") && log.ends_with("; retrying (2/3)\n"), "{log}");
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert_eq!(store.seen.lock().unwrap().bodies, [4 << 20]);
     }
 
     #[test]

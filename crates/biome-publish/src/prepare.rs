@@ -319,7 +319,7 @@ pub fn check_rules(path: &Path) -> Result<PreparedRules, Error> {
     }
     if meta.len() > MAX_RULES_BYTES {
         return Err(Error::invalid(format!(
-            "[rules] wasm: {} is {} bytes; the limit is {MAX_RULES_BYTES} (8 MiB)",
+            "[rules] wasm: {} is {} bytes; the limit is {MAX_RULES_BYTES} (4 MiB)",
             path.display(),
             meta.len()
         )));
@@ -334,7 +334,7 @@ pub fn check_rules(path: &Path) -> Result<PreparedRules, Error> {
 /// host's bundle).
 pub fn check_rules_bytes(bytes: &[u8]) -> Result<Meta, String> {
     if bytes.len() as u64 > MAX_RULES_BYTES {
-        return Err(format!("module is {} bytes; the limit is {MAX_RULES_BYTES} (8 MiB)", bytes.len()));
+        return Err(format!("module is {} bytes; the limit is {MAX_RULES_BYTES} (4 MiB)", bytes.len()));
     }
     let meta = biome_rules_host::validate(bytes).map_err(|e| e.to_string())?;
     if !is_semver(&meta.rules_version) {
@@ -492,7 +492,7 @@ mod tests {
         let big = dir.path().join("big.wasm");
         fs::write(&big, vec![0u8; MAX_RULES_BYTES as usize + 1]).unwrap();
         match check_rules(&big) {
-            Err(Error::Invalid(msg)) => assert!(msg.contains("8 MiB"), "{msg}"),
+            Err(Error::Invalid(msg)) => assert!(msg.contains("4 MiB"), "{msg}"),
             other => panic!("{other:?}"),
         }
         match check_rules(&dir.path().join("missing.wasm")) {

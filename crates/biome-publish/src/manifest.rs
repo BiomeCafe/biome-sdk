@@ -8,7 +8,7 @@
 //!
 //! [release]
 //! version = "0.3.0"          # required
-//! channel = "beta"           # stable | beta, default stable
+//! channel = "beta"           # internal | beta | stable (RELEASE), default stable
 //! notes = "release-notes.md" # optional: a file whose text becomes the notes
 //!
 //! [rules]                    # optional
@@ -18,6 +18,10 @@
 //! path = "dist/windows"      # a folder (sent file by file) or a .zip (sent whole)
 //! entrypoint = "MechaAether.exe"
 //! # delivery = "zip"         # optional: send the folder zipped, as before per-file delivery
+//!
+//! [client.web]               # optional: a build that plays in the browser (biome.cafe/play/<app_id>)
+//! path = "dist/web"          # always a folder, sent file by file
+//! entrypoint = "index.html"  # the page the browser opens; the default for web
 //! ```
 //!
 //! A software product (an add-on, a plugin, a tool):
@@ -47,8 +51,15 @@ use serde::Deserialize;
 
 use crate::error::Error;
 
-/// Platforms a client build may target, in the server's spelling.
+/// Desktop platforms, in the server's spelling: what a download may target.
 pub const PLATFORMS: [&str; 4] = ["windows-x64", "macos-arm64", "macos-x64", "linux-x64"];
+
+/// The platform of a web build: played in the browser at
+/// `biome.cafe/play/<app_id>` (spec §11), always sent file by file.
+pub const WEB: &str = "web";
+
+/// Platforms a client build may target: the desktops and the web.
+pub const CLIENT_PLATFORMS: [&str; 5] = ["windows-x64", "macos-arm64", "macos-x64", "linux-x64", WEB];
 
 /// Release notes limit (characters), as the `game_releases.notes` column.
 pub const MAX_NOTES_CHARS: usize = 4000;
@@ -76,9 +87,13 @@ impl Kind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The release track (docs/RELEASE_TRACKS_SPEC.md): INTERNAL goes live for
+/// the game's managers and invited testers once BioShield has checked it;
+/// BETA (testers) and RELEASE (everyone, once listed) wait for a site admin.
 pub enum Channel {
     Stable,
     Beta,
+    Internal,
 }
 
 impl Channel {
@@ -86,6 +101,7 @@ impl Channel {
         match self {
             Channel::Stable => "stable",
             Channel::Beta => "beta",
+            Channel::Internal => "internal",
         }
     }
 }
@@ -192,7 +208,8 @@ struct RawRules {
 #[serde(deny_unknown_fields)]
 struct RawClient {
     path: String,
-    entrypoint: String,
+    /// Required, except for `[client.web]` (default `index.html`).
+    entrypoint: Option<String>,
     delivery: Option<String>,
 }
 
@@ -253,8 +270,9 @@ impl Manifest {
         let channel = match raw.release.channel.as_deref() {
             None | Some("stable") => Channel::Stable,
             Some("beta") => Channel::Beta,
+            Some("internal") => Channel::Internal,
             Some(other) => {
-                problems.push(format!("[release] channel {other:?} must be \"stable\" or \"beta\""));
+                problems.push(format!("[release] channel {other:?} must be \"internal\", \"beta\" or \"stable\""));
                 Channel::Stable
             }
         };
@@ -337,16 +355,38 @@ impl Manifest {
         let mut clients = Vec::new();
         for (platform, c) in raw.client {
             let table = format!("[client.{platform}]");
-            if !PLATFORMS.contains(&platform.as_str()) {
-                problems.push(format!("{table} unknown platform; expected one of {}", PLATFORMS.join(", ")));
+            if !CLIENT_PLATFORMS.contains(&platform.as_str()) {
+                problems.push(format!("{table} unknown platform; expected one of {}", CLIENT_PLATFORMS.join(", ")));
+            }
+            let web = platform == WEB;
+            if web && is_app_id(&app_id) && !is_dns_label(&app_id) {
+                problems.push(format!(
+                    "{table} {app_id:?} can't be played in a browser: a web build plays at <app_id>.biome.news, so its app id must be 1-63 letters, digits and '-', not ending in '-'"
+                ));
             }
             if c.path.is_empty() {
                 problems.push(format!("{table} path is empty"));
             }
-            if let Some(why) = entrypoint_problem(&c.entrypoint) {
-                problems.push(format!("{table} entrypoint {:?} {why}", c.entrypoint));
+            let entrypoint = match c.entrypoint {
+                Some(e) => e,
+                None if web => "index.html".to_string(),
+                None => {
+                    problems.push(format!("{table} entrypoint is missing: the executable inside the build"));
+                    String::new()
+                }
+            };
+            if !entrypoint.is_empty() {
+                if let Some(why) = entrypoint_problem(&entrypoint) {
+                    problems.push(format!("{table} entrypoint {entrypoint:?} {why}"));
+                }
+            }
+            if web && !(entrypoint.ends_with(".html") || entrypoint.ends_with(".htm")) {
+                problems.push(format!("{table} entrypoint {entrypoint:?}: a web build opens an .html page (index.html)"));
             }
             let is_zip = Path::new(&c.path).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+            if web && (is_zip || c.delivery.as_deref() == Some("zip")) {
+                problems.push(format!("{table} a web build is a folder sent file by file (the browser fetches each file); not a zip"));
+            }
             let delivery = match c.delivery.as_deref() {
                 None | Some("files") if !is_zip => Delivery::Files,
                 None | Some("zip") => Delivery::Zip,
@@ -359,7 +399,7 @@ impl Manifest {
                     Delivery::Files
                 }
             };
-            clients.push(ClientSpec { platform, path: dir.join(&c.path), entrypoint: c.entrypoint, delivery });
+            clients.push(ClientSpec { platform, path: dir.join(&c.path), entrypoint, delivery });
         }
 
         if !problems.is_empty() {
@@ -414,6 +454,16 @@ pub fn is_app_id(s: &str) -> bool {
     let b = s.as_bytes();
     let ok = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
     (3..=64).contains(&b.len()) && ok(&b[0]) && b[1..].iter().all(|c| ok(c) || *c == b'-')
+}
+
+/// An app id that can be a host label (1-63 of `[a-z0-9-]`, not starting or
+/// ending with `-`): what a game with a web build needs, since it plays at
+/// `<app_id>.biome.news` (spec §11).
+pub fn is_dns_label(s: &str) -> bool {
+    (1..=63).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
 }
 
 /// Semantic version `MAJOR.MINOR.PATCH` with an optional `-pre` part (dot
@@ -547,6 +597,55 @@ entrypoint = "bin/mecha-aether"
     }
 
     #[test]
+    fn a_web_build_is_a_folder_sent_file_by_file() {
+        // entrypoint defaults to index.html for the web.
+        let m = parse(&minimal("omg", "0.2.0", "", "[client.web]\npath = \"dist/web\"\n")).unwrap();
+        assert_eq!(m.clients.len(), 1);
+        let c = &m.clients[0];
+        assert_eq!((c.platform.as_str(), c.entrypoint.as_str(), c.delivery), ("web", "index.html", Delivery::Files));
+        // Next to desktop builds, sorted by platform name.
+        let both = parse(&minimal("omg", "0.2.0", "", "[client.web]\npath = \"w\"\nentrypoint = \"play/index.html\"\n[client.windows-x64]\npath = \"d\"\nentrypoint = \"G.exe\"\n")).unwrap();
+        let platforms: Vec<_> = both.clients.iter().map(|c| c.platform.as_str()).collect();
+        assert_eq!(platforms, ["web", "windows-x64"]);
+        assert_eq!(both.clients[0].entrypoint, "play/index.html");
+    }
+
+    #[test]
+    fn a_web_build_is_never_a_zip_and_opens_a_page() {
+        let msg = problems(&minimal("omg", "0.2.0", "", "[client.web]\npath = \"dist/web.zip\"\n"));
+        assert!(msg.contains("[client.web] a web build is a folder sent file by file"), "{msg}");
+        let msg = problems(&minimal("omg", "0.2.0", "", "[client.web]\npath = \"dist/web\"\ndelivery = \"zip\"\n"));
+        assert!(msg.contains("not a zip"), "{msg}");
+        let msg = problems(&minimal("omg", "0.2.0", "", "[client.web]\npath = \"dist/web\"\nentrypoint = \"omg.wasm\"\n"));
+        assert!(msg.contains("an .html page"), "{msg}");
+        // A desktop build still names its executable.
+        let msg = problems(&minimal("omg", "0.2.0", "", "[client.linux-x64]\npath = \"d\"\n"));
+        assert!(msg.contains("[client.linux-x64] entrypoint is missing"), "{msg}");
+    }
+
+    #[test]
+    fn a_web_build_needs_an_app_id_that_is_a_host_label() {
+        for app in ["omg-", &"a".repeat(64)] {
+            let msg = problems(&minimal(app, "0.2.0", "", "[client.web]
+path = \"dist/web\"
+"));
+            assert!(msg.contains("can't be played in a browser"), "{msg}");
+        }
+        // The same id may still ship desktop builds.
+        assert!(parse(&minimal("omg-", "0.2.0", "", "[client.linux-x64]
+path = \"d\"
+entrypoint = \"g\"
+")).is_ok());
+        assert!(is_dns_label("omg") && is_dns_label("a1-b") && !is_dns_label("-a") && !is_dns_label("a-"));
+    }
+
+    #[test]
+    fn a_download_cannot_target_the_web() {
+        let msg = problems(&software("[[download]]\npath = \"a.zip\"\nplatform = \"web\"\n"));
+        assert!(msg.contains("[[download]] #1 platform \"web\""), "{msg}");
+    }
+
+    #[test]
     fn app_id_rule() {
         for ok in ["abc", "mecha-aether", "0ad", "a-b", "a1-", &"a".repeat(64)] {
             assert!(is_app_id(ok), "{ok} should be valid");
@@ -575,6 +674,8 @@ entrypoint = "bin/mecha-aether"
     fn channel_rule() {
         let m = parse(&minimal("abc", "1.0.0", "channel = \"stable\"", ONE_CLIENT)).unwrap();
         assert_eq!(m.channel, Channel::Stable);
+        let m = parse(&minimal("abc", "1.0.0", "channel = \"internal\"", ONE_CLIENT)).unwrap();
+        assert_eq!((m.channel, m.channel.as_str()), (Channel::Internal, "internal"));
         let msg = problems(&minimal("abc", "1.0.0", "channel = \"alpha\"", ONE_CLIENT));
         assert!(msg.contains("[release] channel \"alpha\""), "{msg}");
     }

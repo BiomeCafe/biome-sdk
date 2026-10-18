@@ -40,14 +40,16 @@ bevy = ["dep:bevy_app", "dep:bevy_ecs"]
 host-bin = ["dep:clap", "dep:tracing-subscriber"]
 # Offline verifier for game tickets (ES256 JWT against the published JWKS).
 # Match hosts and tools want this; a game that only forwards tickets doesn't.
-ticket-verify = ["dep:jsonwebtoken", "dep:serde_json", "dep:base64"]
+ticket-verify = ["dep:jsonwebtoken", "dep:base64"]
 # MatchClient: create / join a hosted match and play it over a WebSocket,
 # with reconnection, from sync game code. See docs/MATCH_HOST_SPEC.md §5.
-match-client = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:serde_json", "dep:base64", "dep:biome-rules"]
+match-client = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:base64", "dep:biome-rules"]
 
 [dependencies]
 # Serialization
 serde = { workspace = true }
+# Also reads Biome's installed.json for the relaunch check (relaunch.rs).
+serde_json = { workspace = true }
 bincode = { version = "2.0", features = ["serde"] }
 
 # Async runtime — tokio internally, on a dedicated thread inside BiomeClient.
@@ -70,7 +72,6 @@ uuid = { workspace = true }
 
 # Optional: ticket verification
 jsonwebtoken = { version = "9.3", optional = true }
-serde_json = { workspace = true, optional = true }
 base64 = { version = "0.22", optional = true }
 
 # Optional: match client
@@ -92,6 +93,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # lock via biome-core.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+# Which process is on the other end of the pipe, and its program (peer.rs).
+# 0.59 is already in the workspace lock via biome-app.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [dev-dependencies]
 jsonwebtoken = "9.3"

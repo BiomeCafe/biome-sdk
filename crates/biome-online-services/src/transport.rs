@@ -90,7 +90,8 @@ where
         )));
     }
     framed
-        .send(bytes.into())
+        // Named, not `into()`: tokio-util 0.7.20 gives `Framed` a second `Sink` item type.
+        .send(tokio_util::bytes::Bytes::from(bytes))
         .await
         .map_err(|e: io::Error| BosError::Transport(e.to_string()))
 }
@@ -157,13 +158,28 @@ pub mod platform {
     pub type ServerStream = NamedPipeServer;
     pub type ClientStream = NamedPipeClient;
 
+    /// How often, and how far apart, opening the pipe is tried again while
+    /// every server instance is busy (about half a second in all).
+    pub const PIPE_BUSY_TRIES: u32 = 10;
+    pub const PIPE_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
     pub async fn connect(endpoint: &str) -> Result<ClientStream, BosError> {
         // ERROR_FILE_NOT_FOUND (2) = pipe doesn't exist yet = biome-app not running.
+        // ERROR_PIPE_BUSY (231) = the server exists but its free instance was
+        // just taken (two games connecting at once, or a probe); the accept
+        // loop makes the next one at once, so wait a moment and try again.
         // Any other error is a real transport error worth surfacing verbatim.
-        match ClientOptions::new().open(endpoint) {
-            Ok(c) => Ok(c),
-            Err(e) if e.raw_os_error() == Some(2) => Err(BosError::PlatformUnavailable),
-            Err(e) => Err(BosError::Transport(e.to_string())),
+        let mut tries = 0;
+        loop {
+            match ClientOptions::new().open(endpoint) {
+                Ok(c) => return Ok(c),
+                Err(e) if e.raw_os_error() == Some(2) => return Err(BosError::PlatformUnavailable),
+                Err(e) if e.raw_os_error() == Some(231) && tries + 1 < PIPE_BUSY_TRIES => {
+                    tries += 1;
+                    tokio::time::sleep(PIPE_BUSY_WAIT).await;
+                }
+                Err(e) => return Err(BosError::Transport(e.to_string())),
+            }
         }
     }
 
@@ -174,5 +190,36 @@ pub mod platform {
             .first_pipe_instance(first_instance)
             .create(endpoint)
             .map_err(|e| BosError::Transport(e.to_string()))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::platform;
+
+    /// A client that finds every instance busy waits for the next one
+    /// instead of failing at once.
+    #[tokio::test]
+    async fn a_busy_pipe_is_tried_again() {
+        let ep = format!(r"\\.\pipe\biome-os-test-busy-{}", std::process::id());
+        let first = platform::create_server_pipe(&ep, true).unwrap();
+        let _one = platform::connect(&ep).await.expect("the free instance");
+        first.connect().await.unwrap();
+        // The only instance is taken: the next open sees ERROR_PIPE_BUSY
+        // until a second instance appears 120 ms later.
+        let ep2 = ep.clone();
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            let second = platform::create_server_pipe(&ep2, false).unwrap();
+            second.connect().await.unwrap();
+            second
+        });
+        let two = platform::connect(&ep).await;
+        assert!(two.is_ok(), "{:?}", two.err());
+        let _second = late.await.unwrap();
+        // With no new instance coming, it gives up after the short retry.
+        let started = std::time::Instant::now();
+        assert!(platform::connect(&ep).await.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

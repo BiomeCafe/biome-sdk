@@ -11,14 +11,14 @@ use clap::{Args, Parser, Subcommand};
 use crate::api::{self, Api, ObjectMeta, ReleaseSummary, Upload};
 use crate::error::{Error, EXIT_INVALID, EXIT_OK};
 use crate::files;
-use crate::manifest::{Kind, Manifest};
+use crate::manifest::{Channel, Kind, Manifest};
 use crate::prepare::{self, ClientBuild, Prepared};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "biome-publish",
     version,
-    about = "Publish a release to Biome: a game ([game] in biome.toml), or a software product such as an add-on or plugin, or a shop file listing ([product]; the server knows which). Validate it, upload it, submit it (for review, or live after its virus scan for a file listing of plain files and zips of them).",
+    about = "Publish a release to Biome: a game ([game] in biome.toml), or a software product such as an add-on or plugin, or a shop file listing ([product]; the server knows which). Validate it, upload it, submit it (for review, or live after BioShield has checked it, for a file listing of plain files and zips of them).",
     after_help = "biome.toml: [game] + [release] + [client.<platform>] (+ [rules]), or [product] + [release] + 1-10 [[download]].\n\
                   A client folder is sent file by file: a new version uploads only the files that changed.\n\
                   The publish token is read from BIOME_PUBLISH_TOKEN.\n\
@@ -284,35 +284,57 @@ fn upload(build: &BuildArgs, remote: &RemoteArgs, env: &Env, out: &mut dyn Write
     let _ = writeln!(out, "submitting release {} ...", created.release_id);
     let submitted = api.submit(&created.release_id)?;
     let _ = std::fs::remove_dir_all(&objects_dir);
-    if submitted.status == "approved" {
+    let internal = prepared.channel == Channel::Internal;
+    // Who approves it (migration 20261015193642): the game's managers on
+    // INTERNAL and BETA, a site admin on RELEASE.
+    let reviewer = if prepared.channel == Channel::Stable {
+        "a site admin reviews it"
+    } else {
+        "you or your guild's admins approve it on the game's MANAGE desk"
+    };
+    if submitted.status == "approved" && internal {
+        // BioShield checked every file before (a per-file build's objects).
+        let _ = writeln!(
+            out,
+            "{} {} is live on the INTERNAL track: you, your guild's admins and your internal testers get it now",
+            prepared.app_id, prepared.version
+        );
+    } else if submitted.status == "approved" {
         // A file listing (plain files, or zips of them) goes live on submit.
         let _ = writeln!(out, "{} {} is approved: a file listing is live at once", prepared.app_id, prepared.version);
     } else if !submitted.reasons.is_empty() {
         // A file listing whose files were looked at and held.
-        let _ = writeln!(out, "{} {} is waiting for a site admin's review:", prepared.app_id, prepared.version);
+        let who = if prepared.channel == Channel::Stable { "a site admin's review" } else { "your approval (the game's MANAGE desk)" };
+        let _ = writeln!(out, "{} {} is waiting for {who}:", prepared.app_id, prepared.version);
         for reason in &submitted.reasons {
             let _ = writeln!(out, "  - {reason}");
         }
         if submitted.scan.as_deref() == Some("pending") {
-            let _ = writeln!(out, "Its files are being scanned for viruses too.");
+            let _ = writeln!(out, "BioShield: checking its files too.");
         }
         let _ = writeln!(out, "(`biome-publish status` shows the result)");
+    } else if submitted.after_scan.as_deref() == Some("live") && internal {
+        let _ = writeln!(
+            out,
+            "{} {} is uploaded. BioShield: checking. it goes live on the INTERNAL track (you and your testers) once BioShield has checked its files, no review (`biome-publish status` shows the result)",
+            prepared.app_id, prepared.version
+        );
     } else if submitted.after_scan.as_deref() == Some("live") {
         let _ = writeln!(
             out,
-            "{} {} is being scanned for viruses: a file listing goes live once its files scan clean (`biome-publish status` shows the result)",
+            "{} {} is uploaded. BioShield: checking. a file listing goes live once BioShield has checked its files (`biome-publish status` shows the result)",
             prepared.app_id, prepared.version
         );
     } else if submitted.scan.as_deref() == Some("pending") {
         let _ = writeln!(
             out,
-            "{} {} is {}: its files are being scanned for viruses, then a site admin reviews it (`biome-publish status` shows the result)",
+            "{} {} is {}: BioShield is checking its files, then {reviewer} (`biome-publish status` shows the result)",
             prepared.app_id, prepared.version, submitted.status
         );
     } else {
         let _ = writeln!(
             out,
-            "{} {} is {}: a site admin reviews it next (`biome-publish status` shows the result)",
+            "{} {} is {}: {reviewer} next (`biome-publish status` shows the result)",
             prepared.app_id, prepared.version, submitted.status
         );
     }
@@ -504,7 +526,7 @@ fn status(manifest_path: &Path, remote: &RemoteArgs, env: &Env, out: &mut dyn Wr
 /// Releases as an aligned text table.
 pub fn status_table(releases: &[ReleaseSummary]) -> String {
     let dash = |s: &Option<String>| s.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "-".into());
-    let mut rows = vec![["VERSION", "CHANNEL", "STATUS", "VIRUS SCAN", "CREATED", "SUBMITTED", "REVIEWED", "REVIEW NOTE"].map(String::from)];
+    let mut rows = vec![["VERSION", "CHANNEL", "STATUS", "BIOSHIELD", "CREATED", "SUBMITTED", "REVIEWED", "REVIEW NOTE"].map(String::from)];
     for r in releases {
         rows.push([
             r.version.clone(),
@@ -598,7 +620,7 @@ mod tests {
         let t = status_table(&rows);
         let lines: Vec<_> = t.lines().collect();
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].starts_with("VERSION  CHANNEL  STATUS    VIRUS SCAN  CREATED"), "{t}");
+        assert!(lines[0].starts_with("VERSION  CHANNEL  STATUS    BIOSHIELD  CREATED"), "{t}");
         assert!(lines[1].contains("looks good ship it"), "{t}");
         assert_eq!(lines[1].find("approved"), lines[2].find("rejected"), "{t}");
     }

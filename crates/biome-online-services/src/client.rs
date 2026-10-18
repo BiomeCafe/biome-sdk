@@ -285,10 +285,18 @@ impl BiomeClient {
         };
 
         // Nonce if we have one (explicit beats env; an explicit empty string
-        // means "attach even though the env var is set").
+        // means "attach even though the env var is set"). The env's nonce
+        // is good once: this connect holds it, and it counts as used only
+        // when the hello carrying it has been written (run_io_task). A
+        // connect that never reached the host leaves it for the next one.
+        let mut env_claim = None;
         let nonce = match opts.launch_nonce.clone() {
             Some(n) => Some(n).filter(|n| !n.is_empty()),
-            None => handshake::read_launch_nonce(),
+            None => handshake::claim_launch_nonce().map(|claim| {
+                let n = claim.nonce().to_string();
+                env_claim = Some(claim);
+                n
+            }),
         };
         let (hello, via) = match nonce {
             Some(session_nonce) => (
@@ -334,6 +342,7 @@ impl BiomeClient {
                     run_io_task(
                         endpoint_cloned,
                         hello,
+                        env_claim,
                         via,
                         timeouts,
                         status_for_io,
@@ -538,6 +547,7 @@ impl Drop for BiomeClient {
 async fn run_io_task(
     endpoint: String,
     hello: BosWire,
+    env_claim: Option<handshake::NonceClaim>,
     via: AttachVia,
     (handshake_timeout, consent_timeout): (Duration, Duration),
     status: Arc<AtomicU8>,
@@ -555,10 +565,15 @@ async fn run_io_task(
 
     let mut framed = transport::frame(stream);
 
-    // 1. Send the hello (ClientHello or AttachHello)
+    // 1. Send the hello (ClientHello or AttachHello). Only once it is out
+    //    is the environment's nonce used (dropping the claim on the error
+    //    paths above and here gives it back).
     if let Err(e) = transport::send_wire(&mut framed, &hello).await {
         let _ = handshake_tx.send(Err(e));
         return;
+    }
+    if let Some(claim) = env_claim {
+        claim.sent();
     }
 
     // 2. Wait for the host's answer. `AwaitingConsent` extends the wait to

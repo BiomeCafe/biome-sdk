@@ -258,6 +258,27 @@ async fn create(State(s): State<Shared>, headers: HeaderMap, body: Bytes) -> Res
             i
         }
         None => {
+            // One module per (game, rules_version) among approved releases.
+            let clash = rules.as_ref().and_then(|mine| {
+                m.releases.iter().filter(|r| r.app == app && r.status == "approved").find_map(|r| {
+                    let theirs = r.rules.as_ref()?;
+                    (theirs["rules_version"] == mine["rules_version"] && theirs["sha256"] != mine["sha256"]).then(|| theirs.clone())
+                })
+            });
+            if let (Some(mine), Some(theirs)) = (&rules, clash) {
+                m.create_statuses.push(409);
+                let approved = theirs["sha256"].as_str().unwrap();
+                return json_error(
+                    409,
+                    json!({
+                        "error": "rules-conflict",
+                        "message": format!("rules {} is already approved with a different module (sha256 {}…); ship that exact module, or bump rules_version if the rules changed", mine["rules_version"].as_str().unwrap(), &approved[..12]),
+                        "rules_version": mine["rules_version"],
+                        "sha256": mine["sha256"],
+                        "approved_sha256": approved,
+                    }),
+                );
+            }
             let seq = m.releases.len() + 1;
             m.releases.push(Release {
                 id: format!("00000000-0000-4000-8000-{seq:012}"),
@@ -497,7 +518,7 @@ async fn list(State(s): State<Shared>, Query(q): Query<HashMap<String, String>>,
                 "submitted_at": (r.status == "submitted").then(|| format!("2026-10-04T12:01:{:02}Z", r.seq)),
                 "reviewed_at": null,
                 "scan": if r.status == "submitted" { "pending" } else { "clean" },
-                "scan_note": if r.status == "submitted" { "scanning for viruses" } else { "scanned clean" },
+                "scan_note": if r.status == "submitted" { "BioShield: checking" } else { "BioShield: checked" },
             })
         })
         .collect();
@@ -860,6 +881,34 @@ fn an_existing_version_is_refused_with_exit_2() {
 }
 
 #[test]
+fn a_rules_module_that_clashes_with_the_approved_one_is_refused_before_uploading() {
+    let server = Server::start();
+    let fx = fixture();
+    assert_eq!(cli(&fx, &server.endpoint, Some(TOKEN), "upload").code, EXIT_OK);
+    // Approved, with other bytes under the same rules_version (a rebuild).
+    let theirs = "0".repeat(64);
+    {
+        let mut m = server.mock();
+        m.releases[0].status = "approved".into();
+        m.releases[0].rules.as_mut().unwrap()["sha256"] = json!(theirs);
+    }
+    let puts_before = server.mock().puts.len();
+
+    set_version(&fx, "1.0.1");
+    let r = cli(&fx, &server.endpoint, Some(TOKEN), "upload");
+    assert_eq!(r.code, EXIT_REFUSED, "{}", r.err);
+    assert!(r.err.contains("409 rules-conflict"), "{}", r.err);
+    assert!(r.err.contains("rules 1.0.0 is already approved with a different module"), "{}", r.err);
+    assert!(r.err.contains(&format!("approved module sha256: {theirs}")), "{}", r.err);
+    let mine = sha256_hex(&fs::read(demo_rules()).unwrap());
+    assert!(r.err.contains(&format!("this module sha256:     {mine}")), "{}", r.err);
+    let m = server.mock();
+    assert_eq!(m.create_statuses, [201, 200, 409]);
+    assert_eq!(m.releases.len(), 1, "nothing was created");
+    assert_eq!(m.puts.len(), puts_before, "nothing uploaded after a refusal");
+}
+
+#[test]
 fn a_bad_token_is_refused_with_exit_2() {
     let server = Server::start();
     let fx = fixture();
@@ -898,8 +947,8 @@ fn status_lists_recent_releases() {
     assert_eq!(r.code, EXIT_OK, "{}", r.err);
     let row = r.out.lines().find(|l| l.starts_with(VERSION)).unwrap_or_else(|| panic!("{}", r.out));
     assert!(row.contains("beta") && row.contains("submitted") && row.contains("2026-10-04T12:01:01Z"), "{row}");
-    assert!(row.contains("scanning for viruses"), "{row}");
-    assert!(r.out.contains("VERSION") && r.out.contains("VIRUS SCAN") && r.out.contains("REVIEW NOTE"), "{}", r.out);
+    assert!(row.contains("BioShield: checking"), "{row}");
+    assert!(r.out.contains("VERSION") && r.out.contains("BIOSHIELD") && r.out.contains("REVIEW NOTE"), "{}", r.out);
 }
 
 #[test]
@@ -1077,7 +1126,7 @@ fn a_file_listing_uploads_with_a_product_manifest_and_goes_live_after_its_scan()
     let r = cli(&fx, &server.endpoint, Some(TOKEN), "upload");
     assert_eq!(r.code, EXIT_OK, "{}\n{}", r.out, r.err);
     assert!(
-        r.out.contains(&format!("{FILE_APP} 1.0.0 is being scanned for viruses: a file listing goes live once its files scan clean")),
+        r.out.contains(&format!("{FILE_APP} 1.0.0 is uploaded. BioShield: checking. a file listing goes live once BioShield has checked its files")),
         "{}",
         r.out
     );
@@ -1093,7 +1142,7 @@ fn a_zip_of_plain_files_in_a_file_listing_goes_live_after_its_scan() {
     let fx = file_fixture("\n[[download]]\npath = \"files/extras.zip\"\n");
     let r = cli(&fx, &server.endpoint, Some(TOKEN), "upload");
     assert_eq!(r.code, EXIT_OK, "{}\n{}", r.out, r.err);
-    assert!(r.out.contains(&format!("{FILE_APP} 1.0.0 is being scanned for viruses")), "{}", r.out);
+    assert!(r.out.contains(&format!("{FILE_APP} 1.0.0 is uploaded. BioShield: checking")), "{}", r.out);
     assert!(server.mock().objects.contains_key(&format!("{FILE_APP}/1.0.0/files/extras.zip")));
 }
 
@@ -1109,7 +1158,7 @@ fn a_zip_with_a_program_waits_for_review_and_says_why() {
     assert_eq!(r.code, EXIT_OK, "{}\n{}", r.out, r.err);
     assert!(r.out.contains(&format!("{FILE_APP} 1.0.0 is waiting for a site admin's review:")), "{}", r.out);
     assert!(r.out.contains("  - tools.zip: contains setup.exe"), "{}", r.out);
-    assert!(r.out.contains("Its files are being scanned for viruses too."), "{}", r.out);
+    assert!(r.out.contains("BioShield: checking its files too."), "{}", r.out);
     assert_eq!(server.mock().releases.iter().find(|r| r.app == FILE_APP).unwrap().status, "submitted");
 }
 

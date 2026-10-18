@@ -16,16 +16,20 @@
 //!
 //! [release]
 //! version = "0.3.0"          # semver MAJOR.MINOR.PATCH[-pre], required
-//! channel = "beta"           # stable | beta, default stable
+//! channel = "beta"           # internal | beta | stable (RELEASE), default stable
 //! notes = "release-notes.md" # optional: a file whose text becomes the notes (max 4000 chars)
 //!
 //! [rules]                    # optional, for games the match host runs
 //! wasm = "target/wasm32-unknown-unknown/release/mecha_rules.wasm"
 //!
-//! [client.windows-x64]       # one table per platform: windows-x64, macos-arm64, macos-x64, linux-x64
+//! [client.windows-x64]       # one table per platform: windows-x64, macos-arm64, macos-x64, linux-x64, web
 //! path = "dist/windows"      # a folder (sent file by file) or a .zip (uploaded as is)
 //! entrypoint = "MechaAether.exe"  # the executable inside the build, / separated
 //! # delivery = "zip"         # optional: zip the folder and send it whole instead
+//!
+//! [client.web]               # optional: plays in the browser at biome.cafe/play/<app_id>
+//! path = "dist/web"          # a folder (trunk / wasm-bindgen output), always file by file
+//! entrypoint = "index.html"  # default; use relative URLs inside it (./pkg/game.js)
 //! ```
 //!
 //! A client folder is sent file by file (spec §10): each distinct file is
@@ -38,10 +42,10 @@
 //! `[game]`, no `[rules]` or `[client.*]`, and 1 to 10 downloads. The
 //! server knows which kind the app id is: software takes any file type and
 //! is reviewed; a file listing takes plain files (documents, pictures, 3D
-//! and print files, audio, video) and zips of them, and goes live once its
-//! files scan clean for viruses when the server's look inside finds nothing
-//! that can run (else it waits for a site admin, and `upload` prints why).
-//! Every release's files are scanned; `status` shows the scan:
+//! and print files, audio, video) and zips of them, and goes live once
+//! BioShield has checked its files when the server's look inside finds
+//! nothing that can run (else it waits for a site admin, and `upload` prints
+//! why). Every release's files pass BioShield; `status` shows its check:
 //!
 //! ```toml
 //! [product]

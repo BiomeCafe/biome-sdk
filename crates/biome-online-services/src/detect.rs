@@ -127,14 +127,20 @@ pub fn wake(app_id: &str) -> Result<(), BosError> {
 }
 
 fn wake_with(launcher: &PathBuf, app_id: &str) -> Result<(), BosError> {
-    let url = connect_url(app_id);
+    open_link(launcher, &connect_url(app_id))
+}
+
+/// Hand Biome a `biome://` link through its launcher (what the shell does
+/// for a registered scheme, minus the shell) and return at once. A running
+/// Biome gets the link from the second launch; a closed one starts with it.
+pub(crate) fn open_link(launcher: &PathBuf, url: &str) -> Result<(), BosError> {
     #[cfg(windows)]
     {
         // Spawn the launcher stub directly with the link as its argument —
         // exactly what the shell does for a registered scheme, minus the
         // shell. No console window, no inherited handles we care about.
         std::process::Command::new(launcher)
-            .arg(&url)
+            .arg(url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -147,7 +153,7 @@ fn wake_with(launcher: &PathBuf, app_id: &str) -> Result<(), BosError> {
         std::process::Command::new("open")
             .arg("-a")
             .arg(launcher)
-            .arg(&url)
+            .arg(url)
             .spawn()
             .map(|_| ())
             .map_err(|e| BosError::WakeFailed(format!("open -a {}: {e}", launcher.display())))
@@ -156,7 +162,7 @@ fn wake_with(launcher: &PathBuf, app_id: &str) -> Result<(), BosError> {
     {
         let _ = launcher;
         std::process::Command::new("xdg-open")
-            .arg(&url)
+            .arg(url)
             .spawn()
             .map(|_| ())
             .map_err(|e| BosError::WakeFailed(format!("xdg-open: {e}")))
@@ -207,7 +213,7 @@ pub fn ensure_running(app_id: &str, wake_timeout: Duration) -> Result<PlatformSt
 
 /// Percent-encode anything outside the unreserved set so a hostile app id
 /// can't smuggle extra query parameters into the link.
-fn url_escape(s: &str) -> String {
+pub(crate) fn url_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

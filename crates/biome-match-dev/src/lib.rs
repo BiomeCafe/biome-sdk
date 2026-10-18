@@ -619,6 +619,7 @@ impl Host {
                 json!({
                     "match_id": m.match_id,
                     "host": m.seats.first().map(|s| s.username.clone()).unwrap_or_default(),
+                    "host_user_id": m.seats.first().map(|s| s.user_id.clone()),
                     "created_at_ms": m.created_at,
                     "rules_version": m.rules_version,
                     "config": B64.encode(&m.config),
@@ -1065,7 +1066,7 @@ impl Match {
         Value::Array(
             self.seats
                 .iter()
-                .map(|s| json!({ "seat": s.seat, "username": s.username, "connected": self.conns.iter().any(|c| c.open && c.seat == Some(s.seat)) }))
+                .map(|s| json!({ "seat": s.seat, "user_id": s.user_id, "username": s.username, "connected": self.conns.iter().any(|c| c.open && c.seat == Some(s.seat)) }))
                 .collect(),
         )
     }

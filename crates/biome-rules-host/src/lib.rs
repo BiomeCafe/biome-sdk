@@ -41,8 +41,10 @@ pub const MAX_SEATS: u8 = 254;
 /// Table elements a module may hold (function tables for indirect calls).
 pub const MAX_TABLE_ELEMENTS: usize = 100_000;
 
-/// Largest module accepted (bytes).
-pub const MAX_MODULE_BYTES: usize = 8 * 1024 * 1024;
+/// Largest module accepted (bytes): 4 MiB, as game-publish and the
+/// game_release_files table. Every module of every game shares the match
+/// host's worker size limit (docs/GAME_PUBLISHING_SPEC.md §8).
+pub const MAX_MODULE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Largest single result buffer accepted (bytes).
 pub const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;

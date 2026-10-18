@@ -23,8 +23,10 @@
 //!
 //! - [`client`] — [`BiomeClient`] — what games link against
 //! - [`detect`] — running / installed / not installed, and [`detect::wake`]
+//! - [`relaunch`] — [`restart_through_biome_if_needed`], Steam's `RestartAppIfNecessary`
 //! - [`ticket`] — ticket claims + offline verifier (feature `ticket-verify`)
 //! - [`server`] — IPC server — what biome-app (or `biome-os-host`) runs
+//! - [`peer`] — which process (and program) is on the other end of a connection
 //! - [`protocol`] — wire types ([`BosWire`]) — shared
 //! - [`types`] — public types ([`ConnectInfo`], [`Session`], etc.)
 //! - [`events`] — [`BiomeEvent`] — what the game listens to
@@ -43,6 +45,9 @@
 //! use std::time::Duration;
 //! use biome_online_services::{detect, BiomeClient, BosConfig};
 //!
+//! // 0. Biome's installed copy, started by hand? Biome starts it again with
+//! //    a launch nonce (no prompt); this one exits.
+//! if biome_online_services::restart_through_biome_if_needed("mecha-aether") { return; }
 //! // 1. Make sure Biome is up (starts it when installed but closed).
 //! detect::ensure_running("mecha-aether", Duration::from_secs(60))?;
 //! // 2. Attach (or nonce handshake if Biome launched us). First run prompts.
@@ -64,7 +69,9 @@ pub mod error;
 pub mod events;
 pub mod handshake;
 pub mod netcode_token;
+pub mod peer;
 pub mod protocol;
+pub mod relaunch;
 pub mod server;
 pub mod transport;
 pub mod types;
@@ -75,6 +82,9 @@ pub mod ticket;
 #[cfg(feature = "match-client")]
 pub mod match_client;
 
+#[cfg(feature = "match-client")]
+pub mod public_players;
+
 #[cfg(feature = "bevy")]
 pub mod bevy;
 
@@ -83,6 +93,7 @@ pub use client::{BiomeClient, ConnectOptions, ConnectStatus, PendingClient, Requ
 pub use detect::PlatformState;
 pub use error::BosError;
 pub use events::BiomeEvent;
+pub use relaunch::restart_through_biome_if_needed;
 pub use types::{
     AttachVia, BosConfig, ConnectInfo, GameMode, GameTicket, MapId, MatchId, Region, RoomId,
     Session, TeamId, Transport, VoiceRooms,

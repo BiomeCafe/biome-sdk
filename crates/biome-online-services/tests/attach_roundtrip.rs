@@ -37,6 +37,8 @@ struct Scripted {
     /// How long the "user" takes to answer the prompt.
     think: Duration,
     prompts: Arc<AtomicUsize>,
+    /// Decides without a prompt (Biome's own install, a remembered answer).
+    silent: bool,
 }
 
 impl BosBackend for Scripted {
@@ -51,6 +53,17 @@ impl BosBackend for Scripted {
         assert_eq!(req.app_id, "mecha-aether");
         assert_eq!(req.app_name, "Mecha Aether");
         assert_eq!(req.client_version, "9.9.9");
+        // Over a real pipe/socket the OS names the client: this process
+        // (client and server share it here), pinned at the accept, and its
+        // program is this test.
+        if cfg!(any(windows, target_os = "linux")) {
+            assert_eq!(req.peer_pid, Some(std::process::id()));
+            let exe = req.peer.as_ref().and_then(|p| p.exe()).unwrap();
+            assert_eq!(std::fs::canonicalize(exe).unwrap(), std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap());
+        }
+        if !self.silent {
+            req.prompting.about_to_prompt();
+        }
         tokio::time::sleep(self.think).await;
         self.decision.clone()
     }
@@ -132,7 +145,7 @@ fn attach_allowed_yields_session_and_ticket() {
     let prompts = Arc::new(AtomicUsize::new(0));
     let _server = run_server(
         &ep,
-        Scripted { session: Some(user()), decision: AttachDecision::Allowed, think: Duration::from_millis(300), prompts: prompts.clone() },
+        Scripted { session: Some(user()), decision: AttachDecision::Allowed, think: Duration::from_millis(300), prompts: prompts.clone(), silent: false },
         false,
     );
     assert!(detect::endpoint_accepts(&ep), "server should be detectable");
@@ -161,6 +174,7 @@ fn attach_denied_is_typed() {
             decision: AttachDecision::Rejected(reject::CONSENT_DENIED.into()),
             think: Duration::ZERO,
             prompts: Arc::new(AtomicUsize::new(0)),
+            silent: false,
         },
         false,
     );
@@ -175,7 +189,7 @@ fn attach_without_session_is_not_signed_in() {
     let ep = unique_endpoint();
     let _server = run_server(
         &ep,
-        Scripted { session: None, decision: AttachDecision::Allowed, think: Duration::ZERO, prompts: Arc::new(AtomicUsize::new(0)) },
+        Scripted { session: None, decision: AttachDecision::Allowed, think: Duration::ZERO, prompts: Arc::new(AtomicUsize::new(0)), silent: false },
         false,
     );
     match BiomeClient::connect_with(config(&ep), opts()) {
@@ -189,7 +203,7 @@ fn consent_timeout_fires_when_nobody_answers() {
     let ep = unique_endpoint();
     let _server = run_server(
         &ep,
-        Scripted { session: Some(user()), decision: AttachDecision::Allowed, think: Duration::from_secs(30), prompts: Arc::new(AtomicUsize::new(0)) },
+        Scripted { session: Some(user()), decision: AttachDecision::Allowed, think: Duration::from_secs(30), prompts: Arc::new(AtomicUsize::new(0)), silent: false },
         false,
     );
     let o = ConnectOptions { consent_timeout: Duration::from_millis(500), ..opts() };
@@ -206,7 +220,7 @@ fn background_connect_reports_awaiting_consent() {
     let ep = unique_endpoint();
     let _server = run_server(
         &ep,
-        Scripted { session: Some(user()), decision: AttachDecision::Allowed, think: Duration::from_millis(800), prompts: Arc::new(AtomicUsize::new(0)) },
+        Scripted { session: Some(user()), decision: AttachDecision::Allowed, think: Duration::from_millis(800), prompts: Arc::new(AtomicUsize::new(0)), silent: false },
         false,
     );
     let mut pending = BiomeClient::connect_background(config(&ep), opts());
@@ -234,7 +248,7 @@ fn nonce_path_still_works_and_is_single_use() {
     // handshakes and reports LaunchNonce.
     let _server = run_server(
         &ep,
-        Scripted { session: Some(user()), decision: AttachDecision::Rejected("never".into()), think: Duration::ZERO, prompts: Arc::new(AtomicUsize::new(0)) },
+        Scripted { session: Some(user()), decision: AttachDecision::Rejected("never".into()), think: Duration::ZERO, prompts: Arc::new(AtomicUsize::new(0)), silent: false },
         true,
     );
     let o = ConnectOptions { launch_nonce: Some("issued-by-host".into()), ..opts() };
@@ -251,4 +265,60 @@ fn nothing_running_is_platform_unavailable() {
         Err(BosError::PlatformUnavailable) => {}
         other => panic!("expected PlatformUnavailable, got {:?}", other.map(|_| "client")),
     }
+}
+
+/// A game Biome lets in without asking (its own install) goes straight from
+/// connecting to connected: the player never sees "waiting for consent".
+#[test]
+fn a_silent_allow_never_reports_awaiting_consent() {
+    let ep = unique_endpoint();
+    let _server = run_server(
+        &ep,
+        Scripted {
+            session: Some(user()),
+            decision: AttachDecision::Allowed,
+            think: Duration::from_millis(300),
+            prompts: Arc::new(AtomicUsize::new(0)),
+            silent: true,
+        },
+        false,
+    );
+    let mut pending = BiomeClient::connect_background(config(&ep), opts());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let client = loop {
+        assert_ne!(pending.status(), biome_online_services::ConnectStatus::AwaitingConsent);
+        if let Some(r) = pending.poll() {
+            break r.expect("connect");
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(client.session().unwrap().username, "mandy");
+}
+
+/// The environment's launch nonce is used only once a hello carrying it has
+/// been sent: a connect that couldn't open the pipe leaves it for the next
+/// one, which then signs in on the nonce path; after that, connects attach.
+#[test]
+fn the_launch_nonce_survives_a_connect_that_never_reached_biome() {
+    // The only test here that reads the environment (the others force the
+    // attach path or pass a nonce), so setting it can't disturb them.
+    std::env::set_var(biome_online_services::handshake::ENV_SESSION_NONCE, "from-the-environment");
+    let from_env = || ConnectOptions { launch_nonce: None, ..opts() };
+
+    let ep = unique_endpoint();
+    match BiomeClient::connect_with(config(&ep), from_env()) {
+        Err(BosError::PlatformUnavailable) => {}
+        other => panic!("expected PlatformUnavailable, got {:?}", other.map(|_| "client")),
+    }
+    // A dev-mode host accepts any nonce: what matters is which hello came.
+    let _server = run_server(
+        &ep,
+        Scripted { session: Some(user()), decision: AttachDecision::Allowed, think: Duration::ZERO, prompts: Arc::new(AtomicUsize::new(0)), silent: true },
+        true,
+    );
+    let first = BiomeClient::connect_with(config(&ep), from_env()).expect("nonce handshake");
+    assert_eq!(first.attached_via(), AttachVia::LaunchNonce, "the nonce wasn't spent by the failed connect");
+    let second = BiomeClient::connect_with(config(&ep), from_env()).expect("attach");
+    assert_eq!(second.attached_via(), AttachVia::Consent, "a sent nonce is not shown again");
 }
