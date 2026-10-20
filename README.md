@@ -2,7 +2,7 @@
 
 Build turn-based online games for [Biome](https://biome.cafe). Players sign in through the Biome desktop app, so your game never handles passwords. Matches run on Biome's servers, and every move is checked by your game's own rules. Releases ship to players through the Biome desktop library.
 
-This SDK is **invite-only**. Access to this repository is how you got here. Publishing on Biome needs a second invite: a Biome admin grants your guild publishing rights. See [NOTICE.md](NOTICE.md).
+The SDK is public and free to use for building games and software for Biome, under Biome's SDK licence ([LICENSE.md](LICENSE.md)): you may ship it compiled into your game or program, not republish its source. Publishing on Biome needs your guild to have publishing rights: ask for them from your guild's page, and a Biome admin decides, usually within a few hours.
 
 | You get | Crate |
 |---|---|
@@ -22,15 +22,6 @@ Not making a game? Blender add-ons, plugins and tools publish through the same C
 ---
 
 ## 1. Add the SDK
-
-The repository is private, so cargo has to fetch it with your git login. In your game's repo, add `.cargo/config.toml`:
-
-```toml
-[net]
-git-fetch-with-cli = true
-```
-
-`git ls-remote https://github.com/BiomeCafe/biome-sdk` must work in your shell. If it doesn't, run `gh auth setup-git` or sign in with Git Credential Manager.
 
 Pin a release tag; `main` moves:
 
