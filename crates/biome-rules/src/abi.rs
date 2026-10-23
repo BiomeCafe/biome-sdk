@@ -11,7 +11,8 @@
 
 use crate::engine::{do_apply, do_init, do_timeout};
 use crate::types::{Audience, Meta, Reject, Scoped, Seat, SeatInfo};
-use crate::{codec, wire, Rules};
+use crate::{codec, wire, Rules, Suggest};
+use crate::rng::Rng;
 
 /// Value of `br_abi()`. Bump only for an incompatible change to the exports
 /// or to [`crate::wire`].
@@ -97,4 +98,17 @@ pub fn view<R: Rules>(state: &[u8], seat: u8) -> Vec<u8> {
 /// Ok payload: `[0]` or `[1]` + JSON [`crate::Outcome`].
 pub fn outcome<R: Rules>(state: &[u8]) -> Vec<u8> {
     finish(decode_state::<R>(state).map(|s| wire::encode_outcome(&R::outcome(&s))))
+}
+
+/// The reject `br_suggest` answers with when the game has no move to offer.
+pub const NO_SUGGESTION: &str = "no-suggestion";
+
+/// `view`: postcard `R::View` for `seat`. Ok payload: postcard `R::Move`.
+pub fn suggest<R: Suggest>(view: &[u8], seat: u8, seed: &[u8; 32]) -> Vec<u8> {
+    finish((|| {
+        let view = codec::decode::<R::View>(view).map_err(|e| Reject::new(Reject::BAD_STATE, e))?;
+        let mut rng = Rng::from_seed(*seed);
+        let mv = R::suggest(&view, Seat(seat), &mut rng).ok_or_else(|| Reject::new(NO_SUGGESTION, "nothing to suggest"))?;
+        codec::encode(&mv).map_err(|e| Reject::new("internal", format!("move encode: {e}")))
+    })())
 }

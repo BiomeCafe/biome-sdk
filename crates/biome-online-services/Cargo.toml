@@ -69,6 +69,8 @@ tracing = { workspace = true }
 
 # Time / IDs
 uuid = { workspace = true }
+# The device-bound id of a license (device.rs).
+sha2 = { workspace = true }
 
 # Optional: ticket verification
 jsonwebtoken = { version = "9.3", optional = true }

@@ -36,7 +36,7 @@ use crate::protocol::{
 };
 use crate::peer::PeerProcess;
 use crate::transport::{self, platform};
-use crate::types::{AttachVia, GameTicket, Session};
+use crate::types::{AttachVia, GameTicket, LicenseGrant, Session};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Backend trait + the context it gets
@@ -192,6 +192,18 @@ pub trait BosBackend: Send + Sync + 'static {
         async move {
             let _ = ctx;
             Err(BosError::Request("game tickets are not supported by this host".into()))
+        }
+    }
+
+    /// A signed license for the connected app (docs/GAME_SDK_SPEC.md §10),
+    /// for `version` (the build the app says it is; `None`: the version the
+    /// host installed). The host asks the Biome backend with the user's
+    /// session; the signing key never lives on the desktop. `Err` is a code
+    /// from [`crate::protocol::license_error`] (or a human-readable reason).
+    fn license(&self, ctx: ConnContext, version: Option<String>) -> impl std::future::Future<Output = Result<LicenseGrant, String>> + Send {
+        async move {
+            let _ = (ctx, version);
+            Err(crate::protocol::license_error::UNAVAILABLE.to_string())
         }
     }
 }
@@ -635,6 +647,10 @@ async fn dispatch_request<B: BosBackend>(
         RequestBody::GameTicket => match backend.game_ticket(ctx.clone()).await {
             Ok(t) => ResponseBody::GameTicket(t),
             Err(e) => ResponseBody::Error(e.to_string()),
+        },
+        RequestBody::License { version } => match backend.license(ctx.clone(), version).await {
+            Ok(l) => ResponseBody::License(l),
+            Err(code) => ResponseBody::Error(code),
         },
         other => backend.handle_request(other).await,
     }

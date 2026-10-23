@@ -152,9 +152,18 @@ async fn create(State(s): State<Shared>, headers: HeaderMap, body: Bytes) -> Res
     let clients = req.get("clients").cloned().unwrap_or(Value::Null);
     let downloads = req.get("downloads").cloned().unwrap_or(Value::Null);
     let rules = req.get("rules").cloned();
-    // Like the database: a game sends clients, the software product downloads.
+    // Like the database: a game sends clients, a file listing downloads, a
+    // software product downloads and/or desktop clients (never rules or web).
     let software = app == SW_APP || app == FILE_APP;
-    if software != downloads.is_array() || software == clients.is_array() || (software && rules.is_some()) {
+    let web_client = clients.as_array().is_some_and(|l| l.iter().any(|c| c["platform"] == "web"));
+    let fits = if app == FILE_APP {
+        downloads.is_array() && !clients.is_array() && rules.is_none()
+    } else if app == SW_APP {
+        (downloads.is_array() || clients.is_array()) && rules.is_none() && !web_client
+    } else {
+        clients.is_array() && !downloads.is_array()
+    };
+    if !fits {
         return json_error(400, json!({"error": "wrong-kind", "message": "body does not fit the product"}));
     }
 
@@ -172,7 +181,7 @@ async fn create(State(s): State<Shared>, headers: HeaderMap, body: Bytes) -> Res
             sha256: r["sha256"].as_str().unwrap().into(),
         });
     }
-    if software {
+    if software && downloads.is_array() {
         let Some(list) = downloads.as_array().filter(|a| !a.is_empty() && a.len() <= 10) else {
             return json_error(400, json!({"error": "bad-request", "message": "downloads needs 1-10 entries"}));
         };
@@ -204,11 +213,13 @@ async fn create(State(s): State<Shared>, headers: HeaderMap, body: Bytes) -> Res
         }
     }
     let mut contents: Vec<(String, String, u64, String)> = Vec::new();
-    if !software {
+    if clients.is_array() {
         let Some(list) = clients.as_array().filter(|a| !a.is_empty()) else {
             return json_error(400, json!({"error": "bad-request", "message": "clients needs at least one entry"}));
         };
-        assert!(req.get("downloads").is_none(), "a game body has no downloads key");
+        if !software {
+            assert!(req.get("downloads").is_none(), "a game body has no downloads key");
+        }
         for c in list {
             let platform = c["platform"].as_str().unwrap().to_string();
             assert!(c["entrypoint"].is_string());
@@ -1063,6 +1074,46 @@ fn software_upload_puts_every_download_and_submits() {
     assert_eq!(downloads[0]["label"], "Add-on (Blender 4.2+)");
     assert_eq!(downloads[0]["platform"], "any");
     assert!(downloads[1].get("label").is_none(), "no label, no key: {}", downloads[1]);
+}
+
+/// SOFTWARE_PRODUCTS_SPEC.md §16: a software product with a desktop program,
+/// sent file by file like a game's client, next to a download.
+#[test]
+fn software_with_a_desktop_client_uploads_it_file_by_file() {
+    let server = Server::start();
+    let fx = software_fixture();
+    write(&fx.root.join("app/windows/Wrangler.exe"), b"MZ the program");
+    write(&fx.root.join("app/windows/presets/default.json"), b"{}");
+    let text = fs::read_to_string(&fx.manifest).unwrap();
+    write(
+        &fx.manifest,
+        format!("{text}
+[client.windows-x64]
+path = \"app/windows\"
+entrypoint = \"Wrangler.exe\"
+").as_bytes(),
+    );
+
+    let check = cli(&fx, "http://127.0.0.1:9/never", None, "check");
+    assert_eq!(check.code, EXIT_OK, "{}
+{}", check.out, check.err);
+    assert!(check.out.contains("client    windows-x64"), "{}", check.out);
+
+    let r = cli(&fx, &server.endpoint, Some(TOKEN), "upload");
+    assert_eq!(r.code, EXIT_OK, "{}
+{}", r.out, r.err);
+    let m = server.mock();
+    let rel = m.releases.iter().find(|r| r.app == SW_APP).unwrap();
+    assert_eq!(rel.status, "submitted");
+    assert!(rel.rules.is_none());
+    let clients = rel.clients.as_array().unwrap();
+    assert_eq!((clients.len(), clients[0]["platform"].as_str(), clients[0]["entrypoint"].as_str()), (1, Some("windows-x64"), Some("Wrangler.exe")));
+    let paths: Vec<_> = rel.contents.iter().map(|c| c.1.as_str()).collect();
+    assert_eq!(paths, ["Wrangler.exe", "presets/default.json"]);
+    assert_eq!(rel.downloads.as_array().unwrap().len(), 2);
+    let exe = sha256_hex(b"MZ the program");
+    let raw = biome_publish::files::gunzip_bytes(&m.objects[&format!("{SW_APP}/objects/{exe}")]).unwrap();
+    assert_eq!(raw, b"MZ the program");
 }
 
 #[test]

@@ -12,6 +12,7 @@ The SDK is public and free to use for building games and software for Biome, und
 | The rules SDK: one Rust crate runs in your client and on the server | `biome-rules` |
 | A local match host for development | `biome-match-dev` |
 | The publishing CLI for your CI | `biome-publish` |
+| Licenses for a program sold or tested through Biome (`license::require`) | `biome-sdk` |
 | A rules validator, the same check the server runs | `biome-rules-host` (`validate-rules`) |
 | Two complete example games | `rules-tictactoe` (start here), `rules-highcard` (hidden cards) |
 
@@ -306,8 +307,8 @@ biome-publish status    # review state of recent releases
 ```
 
 **Then:**
-1. Its files pass **BioShield**, Biome's checks for malicious files (`biome-publish status` shows "BioShield: checking", then "BioShield: checked"; a file BioShield flags rejects the release with "BioShield flagged <file>"). Biome doesn't say which tools BioShield runs or what they found, not even to the publisher; if you think a flag is a mistake, send a bug report naming the release and the file, and a Biome admin takes a second look (`/bioshield`). Then it is approved or rejected with a note: on `beta`, by you or your guild's admins, from the release's row under the game's MANAGE (APPROVE / DECLINE); on `stable` (RELEASE, everyone), by a Biome admin. You see it on the GAMES tab and in `biome-publish status`. An `internal` release skips the review: it goes live for you and your testers as soon as BioShield has checked it. Nobody but a Biome admin approves a release BioShield hasn't passed.
-2. Once it's approved, players can install and update your game from the Biome desktop library, as long as the game is **listed**. A listed game also shows up in the website's shop under **GAMES**, with a store page at `https://biome.cafe/products/<app id>` that sends people to the desktop app.
+1. Its files pass **BioShield**, Biome's checks for malicious files (`biome-publish status` shows "BioShield: checking", then "BioShield: checked"; a file BioShield flags rejects the release with "BioShield flagged <file>"). Biome doesn't say which tools BioShield runs or what they found, not even to the publisher; if you think a flag is a mistake, send a bug report naming the release and the file, and a Biome admin takes a second look (`/bioshield`). Then it is approved or rejected with a note: on `beta`, by you or your guild's admins, from the release's row under the game's MANAGE (APPROVE / DECLINE); on `stable` (RELEASE, everyone), by a Biome admin for your game's first RELEASE (the store review), and after that by you, like `beta`. Your guild decides how BETA and RELEASE releases go live: when you approve each one, as soon as BioShield has checked it, or at a set time ("tonight at 9:00 PM"), with guild defaults on the GAMES tab and each game's own under GOING LIVE on its TRACKS & TESTERS desk; you can also give one waiting release its own time on its row (RELEASE_TRACKS_SPEC.md §3.1). You see it on the GAMES tab and in `biome-publish status`. An `internal` release skips the review: it goes live for you and your testers as soon as BioShield has checked it. Nobody but a Biome admin approves a release BioShield hasn't passed.
+2. Once it's approved, players can install and update your game from the Biome desktop library, as long as the game is **listed**. A listed game also shows up in **Biome Store → Games**, with a store page at `https://biome.cafe/store/games/<app id>` that sends people to the desktop app.
 
 **Release tracks: test with chosen people first.** Every release is on one track:
 
@@ -383,8 +384,8 @@ window.addEventListener("message", (e) => {
 
 A software product is anything people download and use with their own tools: a Blender add-on, a plugin, a script pack, a tool. A release is 1 to 10 files of any type (`.zip`, `.py`, `.blend`, `.pdf`, …). Your guild needs the same publishing rights as for games.
 
-1. On your guild page, open **SOFTWARE**, then **+ NEW PRODUCT**. Pick an app id (same rules as games; it becomes the page `https://biome.cafe/products/<app id>`).
-2. **MANAGE**, then **EDIT** the store page: name, summary, description, cover, price (leave it blank for free), license, requirements (e.g. "Blender 4.2+"), tags, homepage. Tick **listed in the shop**.
+1. On your guild page, open **SOFTWARE**, then **+ NEW PRODUCT**. Pick an app id (same rules as games; it becomes the page `https://biome.cafe/store/software/<app id>`).
+2. **MANAGE**, then **EDIT** the store page: name, summary, description, cover, price (leave it blank for free), license, requirements (e.g. "Blender 4.2+"), tags, homepage. Tick **listed in the store**.
 3. Upload a release. Either:
    - **From the website:** MANAGE, then **+ NEW RELEASE**. Version, channel, what's new, **+ ADD FILES**. Each file gets a published name (fix it if your file name has spaces), a platform (usually *any system*) and a label ("Add-on", "Manual"). **UPLOAD & SUBMIT** hashes the files in your browser, uploads them straight to Biome's storage and submits the release.
    - **From CI** with `biome-publish` and a `[product]` manifest (below).

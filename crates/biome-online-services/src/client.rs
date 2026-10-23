@@ -40,7 +40,7 @@ use crate::protocol::{
     CURRENT_SDK_VERSION,
 };
 use crate::transport::{self, platform};
-use crate::types::{AttachVia, BosConfig, ConnectInfo, GameTicket, MatchId, Session, Transport};
+use crate::types::{AttachVia, BosConfig, ConnectInfo, GameTicket, LicenseGrant, MatchId, Session, Transport};
 
 const HANDSHAKE_TIMEOUT_MS: u64 = 2_000;
 const CONSENT_TIMEOUT_SECS: u64 = 120;
@@ -481,6 +481,22 @@ impl BiomeClient {
             other => Err(BosError::Internal(format!(
                 "unexpected response to GameTicket: {other:?}"
             ))),
+        })
+    }
+
+    /// Ask Biome for a signed license for this app (Biome 0.1.28 and
+    /// later), for `version`: the build this is (Biome checks the account's
+    /// edition covers it). `None` asks for the version Biome installed. Most
+    /// apps call `biome_sdk::license::require` instead, which verifies the
+    /// answer, caches it and falls back to the cache. A refusal is
+    /// [`BosError::Request`] with a code from
+    /// [`crate::protocol::license_error`]; an older Biome drops the
+    /// connection, which surfaces as a transport or internal error.
+    pub fn license(&self, version: Option<&str>) -> RequestHandle<LicenseGrant> {
+        self.send_request(RequestBody::License { version: version.map(str::to_string) }, |body| match body {
+            ResponseBody::License(l) => Ok(l),
+            ResponseBody::Error(msg) => Err(BosError::Request(msg)),
+            other => Err(BosError::Internal(format!("unexpected response to License: {other:?}"))),
         })
     }
 

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::events::BiomeEvent;
-use crate::types::{ConnectInfo, GameTicket, MatchId, Session};
+use crate::types::{ConnectInfo, GameTicket, LicenseGrant, MatchId, Session};
 
 /// Current SDK wire version. Server announces what minimum it requires;
 /// client refuses to operate if `MIN_SUPPORTED_BY_SERVER > CURRENT`.
@@ -184,6 +184,17 @@ pub enum RequestBody {
     /// it to a match host, which verifies it offline against the published
     /// public key. See [`crate::ticket`].
     GameTicket,
+
+    // ── Added 2026-10-17 (Biome 0.1.28) ──────────────────────────────────
+    /// "Give me a signed license for this app." The host asks the Biome
+    /// backend with the user's session, for `version` (the build the app
+    /// says it is; else the version its library installed) and this
+    /// device; the answer is [`ResponseBody::License`], or
+    /// [`ResponseBody::Error`] with a code from [`license_error`]
+    /// (`needs-upgrade` when the account's edition doesn't cover `version`).
+    /// A host older than this can't decode the frame and drops the
+    /// connection.
+    License { version: Option<String> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -204,6 +215,50 @@ pub enum ResponseBody {
     // ── Added 2026-10 ────────────────────────────────────────────────────
     /// A freshly minted game ticket.
     GameTicket(GameTicket),
+
+    // ── Added 2026-10-17 (Biome 0.1.28) ──────────────────────────────────
+    /// A license for the connected app ([`RequestBody::License`]).
+    License(LicenseGrant),
+}
+
+/// Stable codes in [`ResponseBody::Error`] for a [`RequestBody::License`].
+/// Anything else is a human-readable reason.
+pub mod license_error {
+    /// Nobody is signed in to Biome.
+    pub const NOT_SIGNED_IN: &str = "not-signed-in";
+    /// This Biome account may not have this app (no entitlement, not a
+    /// tester of the track, the version was withdrawn, the app is off).
+    pub const NOT_ENTITLED: &str = "not-entitled";
+    /// Biome couldn't reach its backend, or the backend can't sign licenses
+    /// yet. Try again later; a cached license is still good.
+    pub const UNAVAILABLE: &str = "unavailable";
+    /// This device couldn't be identified (no machine id).
+    pub const NO_DEVICE: &str = "no-device";
+    /// The account owns an edition of the app, not the one this version
+    /// belongs to: an upgrade ("Trillavio 2026" owned, 2027.0.0 installed).
+    /// Sent as this code, then each edition owned on its own line
+    /// ([`needs_upgrade`], [`parse_needs_upgrade`]).
+    pub const NEEDS_UPGRADE: &str = "needs-upgrade";
+
+    /// The [`NEEDS_UPGRADE`] code with the editions owned. Names never hold
+    /// a line break (the database refuses one); any that did is dropped.
+    pub fn needs_upgrade(editions: &[String]) -> String {
+        let mut code = NEEDS_UPGRADE.to_string();
+        for e in editions.iter().filter(|e| !e.is_empty() && !e.contains(['\n', '\r'])) {
+            code.push('\n');
+            code.push_str(e);
+        }
+        code
+    }
+
+    /// The editions in a [`NEEDS_UPGRADE`] code, or `None` for another code.
+    pub fn parse_needs_upgrade(code: &str) -> Option<Vec<String>> {
+        let mut lines = code.split('\n');
+        if lines.next()? != NEEDS_UPGRADE {
+            return None;
+        }
+        Some(lines.filter(|l| !l.is_empty()).map(str::to_string).collect())
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +297,33 @@ mod tests {
         let bytes = bincode::serde::encode_to_vec(&BosWire::V1(BosMsgV1::Request { request_id: 1, body: RequestBody::GameTicket }), standard()).unwrap();
         // Request = 2, request_id = 1 (varint), GameTicket = 6th RequestBody variant
         assert_eq!(bytes, vec![0, 2, 1, 6]);
+    }
+
+    #[test]
+    fn license_frames_are_appended() {
+        // License is the 8th RequestBody variant (index 7) and the 8th
+        // ResponseBody variant: every older frame keeps its bytes.
+        let bytes = bincode::serde::encode_to_vec(&BosWire::V1(BosMsgV1::Request { request_id: 1, body: RequestBody::License { version: None } }), standard()).unwrap();
+        assert_eq!(bytes, vec![0, 2, 1, 7, 0], "License = 7, then its version: None");
+        let w = BosWire::V1(BosMsgV1::Request { request_id: 1, body: RequestBody::License { version: Some("2027.0.0".into()) } });
+        match roundtrip(&w) {
+            BosWire::V1(BosMsgV1::Request { body: RequestBody::License { version }, .. }) => assert_eq!(version.as_deref(), Some("2027.0.0")),
+            other => panic!("{other:?}"),
+        }
+        let w = BosWire::V1(BosMsgV1::Response {
+            request_id: 4,
+            body: ResponseBody::License(LicenseGrant {
+                token: "h.p.s".into(),
+                expires_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000),
+                app_id: "trillavio".into(),
+            }),
+        });
+        let bytes = bincode::serde::encode_to_vec(&w, standard()).unwrap();
+        assert_eq!(&bytes[..4], &[0, 3, 4, 7], "Response = 3, request_id 4, License = 7");
+        match roundtrip(&w) {
+            BosWire::V1(BosMsgV1::Response { request_id: 4, body: ResponseBody::License(l) }) => assert_eq!(l.token, "h.p.s"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

@@ -84,6 +84,22 @@ impl GameTicket {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Licenses (added 2026-10-17, Biome 0.1.28)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A signed license for the connected app, as the desktop host got it from
+/// the Biome backend: "this user may run this app (this release) on this
+/// device until `expires_at`". An Ed25519-signed compact JWS; the
+/// `biome-sdk` crate's `license` module verifies it against the public keys
+/// compiled into the app and caches it. See docs/GAME_SDK_SPEC.md §10.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LicenseGrant {
+    pub token: String,
+    pub expires_at: SystemTime,
+    pub app_id: String,
+}
+
 /// Which IPC transport the client should use.
 #[derive(Clone, Debug, Default)]
 pub enum Transport {

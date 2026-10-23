@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "biome-match-dev"
-version = "0.1.24"
+version = "0.1.28"
 dependencies = [
  "axum",
  "base64",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "biome-online-services"
-version = "0.1.24"
+version = "0.1.28"
 dependencies = [
  "base64",
  "bevy_app",
@@ -334,6 +334,7 @@ dependencies = [
  "rules-tictactoe",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -347,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "biome-publish"
-version = "0.1.24"
+version = "0.1.28"
 dependencies = [
  "axum",
  "base64",
@@ -366,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "biome-rules"
-version = "0.1.24"
+version = "0.1.28"
 dependencies = [
  "postcard",
  "rand_chacha 0.3.1",
@@ -377,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "biome-rules-host"
-version = "0.1.24"
+version = "0.1.28"
 dependencies = [
  "biome-rules",
  "rules-highcard",
@@ -385,6 +386,21 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "wasmi",
+]
+
+[[package]]
+name = "biome-sdk"
+version = "0.1.28"
+dependencies = [
+ "base64",
+ "biome-online-services",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1654,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "rules-highcard"
-version = "0.1.24"
+version = "0.1.28"
 dependencies = [
  "biome-rules",
  "serde",
@@ -1662,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "rules-tictactoe"
-version = "0.1.24"
+version = "0.1.28"
 dependencies = [
  "biome-rules",
  "serde",

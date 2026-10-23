@@ -40,6 +40,24 @@
 //! # file_name = "..."        # optional: publish under another name
 //! ```
 //!
+//! A software product may also ship a desktop program that the Biome app
+//! installs, updates and starts like a game (SOFTWARE_PRODUCTS_SPEC.md §16):
+//! `[client.<desktop platform>]` tables exactly as a game's (no web build,
+//! no `[rules]`), with or without `[[download]]` files.
+//!
+//! ```toml
+//! [product]
+//! app_id = "trillavio"
+//!
+//! [release]
+//! version = "0.4.2"
+//! channel = "internal"
+//!
+//! [client.windows-x64]
+//! path = "dist/windows"
+//! entrypoint = "Trillavio.exe"
+//! ```
+//!
 //! Paths are relative to the folder the manifest is in. Parsing checks
 //! everything that can be checked without touching the files; whether the
 //! files exist and what is in them is [`crate::prepare`]'s job.
@@ -287,7 +305,7 @@ impl Manifest {
         let rules = match raw.rules {
             None => None,
             Some(_) if kind == Kind::Software => {
-                problems.push("[rules] is for games; a [product] release has [[download]] files only".to_string());
+                problems.push("[rules] is for games; a [product] release has [[download]] files and desktop [client.<platform>] builds".to_string());
                 None
             }
             Some(r) if r.wasm.is_empty() => {
@@ -310,11 +328,13 @@ impl Manifest {
                 }
             }
             Kind::Software => {
-                if !raw.client.is_empty() {
-                    problems.push("[client.<platform>] tables are for games; a [product] release has [[download]] files".to_string());
+                // Desktop clients, installed by the Biome app like a game's;
+                // a web build is for games (played at <app_id>.biome.news).
+                if raw.client.contains_key(WEB) {
+                    problems.push("[client.web] is for games; a [product] ships desktop [client.<platform>] builds and [[download]] files".to_string());
                 }
-                if raw.download.is_empty() {
-                    problems.push("no [[download]]: a software release needs at least one file".to_string());
+                if raw.download.is_empty() && raw.client.is_empty() {
+                    problems.push("no [[download]] and no [client.<platform>]: a software release needs at least one file or a desktop build".to_string());
                 }
                 if raw.download.len() > MAX_DOWNLOADS {
                     problems.push(format!("{} [[download]] entries; a release has at most {MAX_DOWNLOADS}", raw.download.len()));
@@ -793,13 +813,13 @@ file_name = "helper-win.zip"
     }
 
     #[test]
-    fn software_has_downloads_and_nothing_else() {
+    fn software_has_downloads_and_desktop_clients_only() {
         let msg = problems(&software(""));
-        assert!(msg.contains("no [[download]]"), "{msg}");
+        assert!(msg.contains("no [[download]] and no [client.<platform>]"), "{msg}");
         let msg = problems(&software(&format!("{ONE_DOWNLOAD}\n[rules]\nwasm = \"r.wasm\"\n")));
         assert!(msg.contains("[rules] is for games"), "{msg}");
-        let msg = problems(&software(&format!("{ONE_DOWNLOAD}\n{ONE_CLIENT}")));
-        assert!(msg.contains("[client.<platform>] tables are for games"), "{msg}");
+        let msg = problems(&software("[client.web]\npath = \"dist/web\"\n"));
+        assert!(msg.contains("[client.web] is for games"), "{msg}");
         let msg = problems(&minimal("abc", "1.0.0", "", &format!("{ONE_CLIENT}\n{ONE_DOWNLOAD}")));
         assert!(msg.contains("[[download]] is for software products"), "{msg}");
         let eleven: String = (0..11).map(|i| format!("[[download]]\npath = \"f{i}.zip\"\n")).collect();
@@ -807,6 +827,25 @@ file_name = "helper-win.zip"
         assert!(msg.contains("at most 10"), "{msg}");
         let ten: String = (0..10).map(|i| format!("[[download]]\npath = \"f{i}.zip\"\n")).collect();
         assert_eq!(parse(&software(&ten)).unwrap().downloads.len(), 10);
+    }
+
+    /// SOFTWARE_PRODUCTS_SPEC.md §16: a desktop program, installed by the
+    /// Biome app like a game, with or without downloads.
+    #[test]
+    fn software_may_ship_a_desktop_client() {
+        let m = parse(&software(ONE_CLIENT)).unwrap();
+        assert_eq!(m.kind, Kind::Software);
+        assert!(m.downloads.is_empty() && m.rules.is_none());
+        assert_eq!(m.clients.len(), 1);
+        assert_eq!((m.clients[0].platform.as_str(), m.clients[0].entrypoint.as_str()), ("windows-x64", "Game.exe"));
+        assert_eq!(m.clients[0].delivery, Delivery::Files);
+        let both = parse(&software(&format!("{ONE_DOWNLOAD}\n{ONE_CLIENT}"))).unwrap();
+        assert_eq!((both.clients.len(), both.downloads.len()), (1, 1));
+        // The same checks as a game's client.
+        let msg = problems(&software("[client.windows-x64]\npath = \"d\"\n"));
+        assert!(msg.contains("[client.windows-x64] entrypoint is missing"), "{msg}");
+        let msg = problems(&software("[client.amiga]\npath = \"d\"\nentrypoint = \"g\"\n"));
+        assert!(msg.contains("[client.amiga] unknown platform"), "{msg}");
     }
 
     #[test]

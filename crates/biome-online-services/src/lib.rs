@@ -24,6 +24,7 @@
 //! - [`client`] — [`BiomeClient`] — what games link against
 //! - [`detect`] — running / installed / not installed, and [`detect::wake`]
 //! - [`relaunch`] — [`restart_through_biome_if_needed`], Steam's `RestartAppIfNecessary`
+//! - [`device`] — the device-bound id a license carries (licenses: the `biome-sdk` crate)
 //! - [`ticket`] — ticket claims + offline verifier (feature `ticket-verify`)
 //! - [`server`] — IPC server — what biome-app (or `biome-os-host`) runs
 //! - [`peer`] — which process (and program) is on the other end of a connection
@@ -65,6 +66,7 @@
 
 pub mod client;
 pub mod detect;
+pub mod device;
 pub mod error;
 pub mod events;
 pub mod handshake;
@@ -95,6 +97,6 @@ pub use error::BosError;
 pub use events::BiomeEvent;
 pub use relaunch::restart_through_biome_if_needed;
 pub use types::{
-    AttachVia, BosConfig, ConnectInfo, GameMode, GameTicket, MapId, MatchId, Region, RoomId,
+    AttachVia, BosConfig, ConnectInfo, GameMode, GameTicket, LicenseGrant, MapId, MatchId, Region, RoomId,
     Session, TeamId, Transport, VoiceRooms,
 };

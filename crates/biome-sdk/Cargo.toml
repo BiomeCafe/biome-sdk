@@ -1,0 +1,36 @@
+[package]
+name = "biome-sdk"
+version.workspace = true
+edition.workspace = true
+description = "The Biome SDK for apps and games: everything in biome-online-services (sign-in through Biome, tickets, relaunch, match client) plus licenses (license::require)."
+
+# A thin crate on purpose: the IPC client lives in biome-online-services
+# (which the desktop app shares); this adds what only an app needs, the
+# license check with Biome's public keys compiled in. The public SDK repo
+# (BiomeCafe/biome-sdk, scripts/build-sdk.mjs) carries it.
+
+[lib]
+name = "biome_sdk"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Passed through to biome-online-services.
+ticket-verify = ["biome-online-services/ticket-verify"]
+match-client = ["biome-online-services/match-client"]
+bevy = ["biome-online-services/bevy"]
+
+[dependencies]
+biome-online-services = { path = "../biome-online-services" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = "2"
+# Base64url for the token's parts; Ed25519 to verify its signature. Both
+# already in the workspace lock (jsonwebtoken, rustls).
+base64 = "0.22"
+ring = "0.17"
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid = { workspace = true }

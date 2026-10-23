@@ -140,18 +140,34 @@ pub fn install_dir(launcher: &Path, app_id: &str) -> Option<PathBuf> {
 pub const CAPABILITIES_FILE: &str = "biome-capabilities";
 /// The line in [`CAPABILITIES_FILE`] that says `biome://run/<app_id>` works.
 pub const RUN_LINKS: &str = "run-links";
+/// The line in [`CAPABILITIES_FILE`] that says Biome answers license
+/// requests (`RequestBody::License`, Biome 0.1.28 and later).
+pub const LICENSES: &str = "licenses";
 
 /// Does the Biome behind `launcher` take run links? Looks for
 /// [`RUN_LINKS`] in [`CAPABILITIES_FILE`] in `current/` next to the
 /// launcher stub (an installed Biome), or next to the launcher itself.
 /// Reads two small files, no IPC: Biome may not be running.
 pub fn takes_run_links(launcher: &Path) -> bool {
+    has_capability(launcher, RUN_LINKS)
+}
+
+/// Does the Biome behind `launcher` say it can do `capability` (a line of
+/// its [`CAPABILITIES_FILE`])? See [`takes_run_links`].
+pub fn has_capability(launcher: &Path, capability: &str) -> bool {
     let Some(dir) = launcher.parent() else {
         return false;
     };
     [dir.join("current").join(CAPABILITIES_FILE), dir.join(CAPABILITIES_FILE)].iter().any(|file| {
-        std::fs::read_to_string(file).is_ok_and(|text| text.lines().any(|line| line.trim() == RUN_LINKS))
+        std::fs::read_to_string(file).is_ok_and(|text| text.lines().any(|line| line.trim() == capability))
     })
+}
+
+/// Does the installed Biome (the `biome:` launcher's) answer license
+/// requests? `None` when no Biome is installed.
+pub fn installed_biome_issues_licenses() -> Option<bool> {
+    let launcher = detect::installed_launcher().and_then(|l| canonical(&l))?;
+    Some(has_capability(&launcher, LICENSES))
 }
 
 /// What `installed.json` says, as far as starting the game goes.
@@ -247,27 +263,46 @@ pub fn decide(
     }
 }
 
+/// What [`restart_through_biome`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestartOutcome {
+    /// Biome is starting the installed copy: exit now.
+    Relaunched,
+    /// Nothing to do (see [`Skip`]): run as is.
+    Skipped(Skip),
+    /// This is Biome's installed copy, started outside Biome, and handing
+    /// it to Biome failed.
+    Failed(String),
+}
+
+/// [`restart_through_biome_if_needed`] with the reason: `Failed` tells a
+/// program that must run through Biome (a licensed one) from one that
+/// simply isn't Biome's install.
+pub fn restart_through_biome(app_id: &str) -> RestartOutcome {
+    match decide(app_id, &RelaunchFacts::gather(), read_install_record, Path::is_file) {
+        Relaunch::Through { launcher } => match detect::open_link(&launcher, &run_url(app_id)) {
+            Ok(()) => {
+                tracing::info!(app_id, "started outside Biome; Biome is starting the installed game");
+                RestartOutcome::Relaunched
+            }
+            Err(e) => {
+                tracing::warn!(app_id, "could not hand the game to Biome, running as is: {e}");
+                RestartOutcome::Failed(e.to_string())
+            }
+        },
+        Relaunch::Skip(why) => {
+            tracing::debug!(app_id, ?why, "not restarting through Biome");
+            RestartOutcome::Skipped(why)
+        }
+    }
+}
+
 /// If this is Biome's installed copy of `app_id` and Biome didn't start it,
 /// ask Biome to start it (`biome://run/<app_id>`) and return `true`: the
 /// game should exit at once. `false` in every other case (see the module
 /// docs), and when handing the link over fails, so the game just runs.
 pub fn restart_through_biome_if_needed(app_id: &str) -> bool {
-    match decide(app_id, &RelaunchFacts::gather(), read_install_record, Path::is_file) {
-        Relaunch::Through { launcher } => match detect::open_link(&launcher, &run_url(app_id)) {
-            Ok(()) => {
-                tracing::info!(app_id, "started outside Biome; Biome is starting the installed game");
-                true
-            }
-            Err(e) => {
-                tracing::warn!(app_id, "could not hand the game to Biome, running as is: {e}");
-                false
-            }
-        },
-        Relaunch::Skip(why) => {
-            tracing::debug!(app_id, ?why, "not restarting through Biome");
-            false
-        }
-    }
+    restart_through_biome(app_id) == RestartOutcome::Relaunched
 }
 
 #[cfg(test)]
@@ -440,5 +475,23 @@ mod tests {
         // A debug test build, outside any games folder: always false, and
         // nothing is started.
         assert!(!restart_through_biome_if_needed("omg"));
+        let expected = if cfg!(windows) { Skip::DebugBuild } else { Skip::Unsupported };
+        assert_eq!(restart_through_biome("omg"), RestartOutcome::Skipped(expected));
+    }
+
+    #[test]
+    fn capabilities_are_read_line_by_line() {
+        let dir = std::env::temp_dir().join(format!("biome-relaunch-licenses-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("current")).unwrap();
+        let launcher = dir.join("Biome.exe");
+        // Biome 0.1.18 to 0.1.23: run links, no licenses.
+        std::fs::write(dir.join("current").join(CAPABILITIES_FILE), "run-links\n").unwrap();
+        assert!(has_capability(&launcher, RUN_LINKS) && !has_capability(&launcher, LICENSES));
+        // 0.1.28 and later.
+        std::fs::write(dir.join("current").join(CAPABILITIES_FILE), "run-links\nlicenses\n").unwrap();
+        assert!(has_capability(&launcher, RUN_LINKS) && has_capability(&launcher, LICENSES));
+        assert!(!has_capability(&launcher, "licens"), "whole lines only");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

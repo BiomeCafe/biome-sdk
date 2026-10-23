@@ -132,6 +132,10 @@ fn check_signatures(s: &Session) -> Result<(), HostError> {
     i.get_typed_func::<(u32, u32), u64>(st, "br_to_move").map_err(|e| bad("br_to_move", e))?;
     i.get_typed_func::<(u32, u32, u32), u64>(st, "br_view").map_err(|e| bad("br_view", e))?;
     i.get_typed_func::<(u32, u32), u64>(st, "br_outcome").map_err(|e| bad("br_outcome", e))?;
+    // Optional (biome_rules::Suggest): checked only when present.
+    if i.get_export(st, "br_suggest").is_some() {
+        i.get_typed_func::<(u32, u32, u32, u32), u64>(st, "br_suggest").map_err(|e| bad("br_suggest", e))?;
+    }
     Ok(())
 }
 

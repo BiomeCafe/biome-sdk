@@ -112,14 +112,40 @@ pub trait LegalMoves: Rules {
     fn legal_moves(view: &Self::View, seat: Seat) -> Vec<Self::Move>;
 }
 
+/// Optional: a move for `seat`, chosen from its *view*. A host's bots play
+/// these (a bot in a card game sees its own hand, never the others') and a
+/// hint shows one. `None`: nothing to suggest. Exported as `br_suggest` by
+/// `export!(MyGame, suggest)`.
+pub trait Suggest: Rules {
+    fn suggest(view: &Self::View, seat: Seat, rng: &mut Rng) -> Option<Self::Move>;
+}
+
 /// Generate the WebAssembly exports (`br_abi`, `br_alloc`, `br_free`,
 /// `br_meta`, `br_init`, `br_apply`, `br_timeout`, `br_to_move`, `br_view`,
 /// `br_outcome`) for a [`Rules`] implementation. Expands to nothing on
 /// native targets, so the same crate links into the game client unchanged.
 ///
-/// Put it once at the crate root: `biome_rules::export!(MyGame);`
+/// Put it once at the crate root: `biome_rules::export!(MyGame);`, or
+/// `biome_rules::export!(MyGame, suggest);` for a game that implements
+/// [`Suggest`] (adds the optional `br_suggest`).
 #[macro_export]
 macro_rules! export {
+    ($rules:ty, suggest) => {
+        $crate::export!($rules);
+
+        #[cfg(target_arch = "wasm32")]
+        const _: () = {
+            use $crate::abi;
+            use $crate::export as ex;
+
+            /// # Safety
+            /// `view` must describe a buffer from `br_alloc`; `seed` points at 32 bytes.
+            #[no_mangle]
+            pub unsafe extern "C" fn br_suggest(view: u32, view_len: u32, seat: u32, seed: u32) -> u64 {
+                ex::give(abi::suggest::<$rules>(ex::slice(view, view_len), ex::seat(seat), &ex::seed(seed)))
+            }
+        };
+    };
     ($rules:ty) => {
         #[cfg(target_arch = "wasm32")]
         const _: () = {

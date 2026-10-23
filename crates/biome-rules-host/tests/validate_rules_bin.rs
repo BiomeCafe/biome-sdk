@@ -91,3 +91,27 @@ fn nothing_to_check_is_an_error() {
     assert!(!bin().output().unwrap().status.success());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_chat_workers_hosted_games_pass() {
+    // cloudflare/biome-chat/games/<kind>.wasm (scripts/build-chat-games.sh):
+    // every module but the board games' judge is a rules module. The public
+    // SDK (scripts/build-sdk.mjs) ships no chat worker: nothing to check there.
+    let dir = repo().join("cloudflare/biome-chat/games");
+    if !dir.is_dir() {
+        return;
+    }
+    let mut n = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !name.ends_with(".wasm") || name == "arcade_judge.wasm" {
+            continue;
+        }
+        let module = biome_rules_host::RulesModule::load(&std::fs::read(&path).unwrap())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(format!("{}.wasm", module.meta().name), name, "the file is named after the game");
+        n += 1;
+    }
+    assert!(n >= 1, "no hosted games in {}", dir.display());
+}
